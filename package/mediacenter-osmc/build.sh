@@ -4,6 +4,7 @@
 #!/bin/bash
 
 . ../common.sh
+. ./olympia-host-cleanup.sh # olympia/osmc fork: restore control files and unmount the chroot on exit
 
 if [ "$1" == "rbp2" ] || [ "$1" == "rbp4" ] || [ "$1" == "vero3" ] || [ "$1" == "vero5" ]
 then
