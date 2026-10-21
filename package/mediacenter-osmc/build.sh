@@ -361,13 +361,24 @@ then
 	fi
         if [ "$1" == "vero5" ]
         then
-           ADDONS_TO_BUILD="${ALL}"
+           ADDONS_TO_BUILD="${ALL} inputstream.airplay"
            echo "set(APP_RENDER_SYSTEM gles)" >> ../Toolchain.mk
            echo "set(OPENGLES_gl_LIBRARY /opt/vero5/lib/libEGL.so)" >> ../Toolchain.mk
            echo "set(OPENGLES_INCLUDE_DIR /opt/vero5/include)" >> ../Toolchain.mk
         fi
         cmake -DOVERRIDE_PATHS=1 -DCMAKE_INSTALL_PREFIX=${out}/usr/ -DBUILD_DIR=$(pwd) -DADDONS_TO_BUILD="${ADDONS_TO_BUILD}" -DCMAKE_TOOLCHAIN_FILE=../Toolchain.mk ../
         if [ $? != 0 ]; then echo "Configuring binary addons failed" && exit 1; fi
+        if [ "$1" == "vero5" ]
+        then
+           # inputstream.airplay is not in repo-binary-addons. Add its definition
+           # only after the first configure has bootstrapped the others: with any
+           # definition already present, Kodi skips the bootstrap.
+           mkdir -p ../addons/inputstream.airplay
+           echo "inputstream.airplay https://github.com/popcornmix/inputstream.airplay main" > ../addons/inputstream.airplay/inputstream.airplay.txt
+           echo "linux" > ../addons/inputstream.airplay/platforms.txt
+           cmake .
+           if [ $? != 0 ]; then echo "Configuring inputstream.airplay failed" && exit 1; fi
+        fi
         cd ../
 	# Update Matrix screensaver logo
 	cp ../../../../patches/logo.png visualization.matrix/visualization.matrix/resources/textures/logo.png || true # Just in case user isn't building binaddons
