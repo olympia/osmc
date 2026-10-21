@@ -1,0 +1,72 @@
+From a0f7e034592bbe8633913d734f24c03bcbc29b03 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 21 Aug 2026 11:53:23 +0100
+Subject: [PATCH] Application: don't hold the frame move guard while closing
+ the player
+
+Closing a player can block for a long time. PAPlayer::CloseFile fades its
+streams out (up to a second), waits for its thread to terminate, and then
+waits for outstanding jobs to drain. StopPlaying() is reached from
+CApplication::FrameMove(), which holds m_frameMoveGuard for the frame, so
+for that entire period no script thread can enter the GUI:
+XBMCAddonUtils::GuiLock, taken by xbmc.getCondVisibility() among much of the
+add-on GUI API, blocks on exactly that mutex.
+
+That is normally only added latency. It deadlocks when something the close
+path waits on in turn needs a script thread to make progress: the main
+thread will not release the guard until the player has closed, and the
+script thread cannot run until the guard is released.
+
+Seen on a Raspberry Pi while stopping an add-on supplied audio stream.
+Pressing Stop left Kodi unresponsive to all further input and it had to be
+restarted; the two threads involved were:
+
+  Thread 1 (main):
+    CApplication::OnAction -> StopPlaying -> CApplicationPlayer::ClosePlayer
+      -> PAPlayer::CloseFile -> PAPlayer::SoftStop -> blocked on mutex
+
+  Thread 27 (LanguageInvoker, plugin.video.youtube service.py):
+    XBMCAddon::xbmc::getCondVisibility -> GuiLock -> blocked on mutex
+
+Nothing about this is specific to that add-on; any script polling a GUI
+condition while music is stopped can be the second party.
+
+CVideoPlayer::CloseFile already defends itself here, dropping the graphics
+context around StopThread(), which is why VideoPlayer playback does not
+show the problem and PAPlayer does. Rather than duplicating that in every
+player, release the door once at the point the player is closed, so script
+threads keep running for as long as the close takes and the cycle cannot
+form. The idiom matches CApplication::Process(), which already exits the
+graphics context and drops m_frameMoveGuard so script threads can shut
+down.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
+xbmc/xbmc#29040.
+---
+ xbmc/application/Application.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 714ea91..025542a 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -2722,11 +2722,17 @@ void CApplication::StopPlaying()
+ 
+   if (gui)
+   {
+-    int iWin = gui->GetWindowManager().GetActiveWindow();
+     const auto appPlayer = GetComponent<CApplicationPlayer>();
+     if (appPlayer->IsPlaying())
+     {
+-      appPlayer->ClosePlayer();
++      {
++        // let script threads into the GUI while we close, or they can deadlock us
++        CSingleExit exitGfx(CServiceBroker::GetWinSystem()->GetGfxContext());
++        CSingleExit exitFrameMove(m_frameMoveGuard);
++        appPlayer->ClosePlayer();
++      }
++
++      const int iWin = gui->GetWindowManager().GetActiveWindow();
+ 
+       // turn off visualisation window when stopping
+       if ((iWin == WINDOW_VISUALISATION ||
