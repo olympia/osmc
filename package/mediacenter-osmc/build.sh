@@ -378,6 +378,11 @@ then
            echo "linux" > ../addons/inputstream.airplay/platforms.txt
            cmake .
            if [ $? != 0 ]; then echo "Configuring inputstream.airplay failed" && exit 1; fi
+           # Build it before the other add-ons: vfs.sftp and vfs.libarchive put a
+           # static OpenSSL into the shared depends, and if that is there first,
+           # inputstream.airplay finds it instead of the system one and fails to link.
+           $BUILD inputstream.airplay
+           if [ $? != 0 ]; then echo "Building inputstream.airplay failed" && exit 1; fi
         fi
         cd ../
 	# Update Matrix screensaver logo
