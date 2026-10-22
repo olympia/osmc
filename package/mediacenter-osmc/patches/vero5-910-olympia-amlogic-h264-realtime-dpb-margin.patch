@@ -1,0 +1,136 @@
+From bab91ff95bb8c34c520bdb7590a201fee281aab8 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Thu, 22 Oct 2026 23:18:51 +0200
+Subject: [PATCH] Amlogic H264Codec: give a live stream a larger frame pool
+
+The H.264 decoder sizes its frame pool as its DPB size plus the
+reorder_dpb_size_margin module parameter, 6 by default. A live stream
+whose SPS has no bitstream_restriction gets its DPB size from the level:
+AirPlay screen mirroring at 1920x1080, level 4.0, gets 6, so 12 buffers
+in all. The decoder runs out of them after the first few pictures
+("force unmark one frame", "h264_reset_bufmgr frame count 12") and stops
+returning pictures while it keeps taking input, so the picture freezes.
+The portrait 498x1080 stream gets a DPB of 10 and 16 buffers, and plays.
+
+The driver copies the margin into a decoder instance when the instance
+is created. For a realtime stream raise it to 10 while the instance is
+created and put the old value back afterwards, so files and other
+decoder instances keep the default. This is done both when the decoder
+is opened and when it is reset, as libamcodec resets by closing and
+re-initialising the codec, which creates a new instance. Tested by hand:
+with the margin at 10 the 1920x1080 mirroring stream keeps playing.
+
+The parameter is read with GetIntDec and written with SetUInt32, as
+GetInt parses hex. Writing it needs the parameter added to the
+permissions the vero5 watchdog grants.
+---
+ .../DVDCodecs/Video/amlogic/H264Codec.cpp     | 75 ++++++++++++++++++-
+ 1 file changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp
+index 335c335..91e522e 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "utils/AMLUtils.h"
+ #include "utils/BitstreamConverter.h"
++#include "utils/SysfsUtils.h"
+ #include "utils/log.h"
+ #include "settings/Settings.h"
+ #include "settings/VeroSettings.h"
+@@ -32,6 +33,70 @@
+ 
+ using namespace amlogic;
+ 
++namespace
++{
++// The decoder sizes its frame pool as its DPB size plus this margin, and copies
++// the module parameter into a decoder instance when the instance is created. A
++// live 1080p level 4.x stream without bitstream_restriction gets a DPB of 6, and
++// with the default margin of 6 the 12 buffers run out and the decoder stops
++// returning pictures.
++constexpr const char* REORDER_MARGIN_PARAM =
++		"/sys/module/amvdec_mh264/parameters/reorder_dpb_size_margin";
++constexpr uint32_t REALTIME_REORDER_MARGIN = 10;
++
++// Raises the margin for a realtime stream while a decoder instance is created,
++// and puts the old value back when it goes out of scope, so files and other
++// decoder instances keep the default.
++class RealtimeMarginGuard
++{
++public:
++	explicit RealtimeMarginGuard(bool realtime)
++	{
++		if (!realtime) {
++			return;
++		}
++
++		if (SysfsUtils::GetIntDec(REORDER_MARGIN_PARAM, m_oldMargin) != 0) {
++			CLog::Log(LOGDEBUG, "H264Codec: cannot read {}", REORDER_MARGIN_PARAM);
++			return;
++		}
++
++		if (m_oldMargin >= REALTIME_REORDER_MARGIN) {
++			return;
++		}
++
++		if (SysfsUtils::SetUInt32(REORDER_MARGIN_PARAM, REALTIME_REORDER_MARGIN) != 0) {
++			CLog::Log(LOGDEBUG, "H264Codec: cannot set {}", REORDER_MARGIN_PARAM);
++			return;
++		}
++
++		m_restore = true;
++		CLog::Log(LOGDEBUG, "H264Codec: realtime stream, reorder_dpb_size_margin {} -> {}",
++			m_oldMargin, REALTIME_REORDER_MARGIN);
++	}
++
++	~RealtimeMarginGuard()
++	{
++		if (!m_restore) {
++			return;
++		}
++
++		if (SysfsUtils::SetUInt32(REORDER_MARGIN_PARAM, m_oldMargin) == 0) {
++			CLog::Log(LOGDEBUG, "H264Codec: reorder_dpb_size_margin restored to {}", m_oldMargin);
++		} else {
++			CLog::Log(LOGDEBUG, "H264Codec: cannot restore {} to {}", REORDER_MARGIN_PARAM, m_oldMargin);
++		}
++	}
++
++	RealtimeMarginGuard(const RealtimeMarginGuard&) = delete;
++	RealtimeMarginGuard& operator=(const RealtimeMarginGuard&) = delete;
++
++private:
++	uint32_t m_oldMargin = 0;
++	bool m_restore = false;
++};
++} // namespace
++
+ class H264CodecInfo : public AMLVideoCodecInfo
+ {
+ public:
+@@ -184,6 +249,9 @@ CDVDVideoCodec::VCReturn H264Codec::getPicture(VideoPicture *pVideoPicture)
+ 
+ bool H264Codec::openDecoder(CDVDStreamInfo &hints)
+ {
++	// The decoder instance is created here.
++	RealtimeMarginGuard marginGuard(m_processInfo.IsRealtimeStream());
++
+ 	if (AMLInsecureVideoCodec::openDecoder(hints)) {
+ 		// The decoder is only opened once prepareFrame() has accepted a keyframe,
+ 		// so keep m_hasKeyframe: clearing it here drops every frame until the next one.
+@@ -195,7 +263,12 @@ bool H264Codec::openDecoder(CDVDStreamInfo &hints)
+ 
+ void H264Codec::reset()
+ {
+-	AMLInsecureVideoCodec::reset();
++	{
++		// libamcodec resets by closing and re-initialising the codec, which
++		// creates a new decoder instance.
++		RealtimeMarginGuard marginGuard(m_processInfo.IsRealtimeStream());
++		AMLInsecureVideoCodec::reset();
++	}
+ 
+ 	m_hasKeyframe = false;
+ 	if (m_bitstream) {
