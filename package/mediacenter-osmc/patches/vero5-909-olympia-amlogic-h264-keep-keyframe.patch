@@ -1,0 +1,38 @@
+From 300260070043ebc7ee5b70a1a69b6c757901f83b Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Thu, 22 Oct 2026 08:30:39 +0200
+Subject: [PATCH] Amlogic H264Codec: keep the keyframe found before the decoder
+ opens
+
+CDVDVideoCodecAmlogic::AddData() runs prepareFrame() before it opens the
+decoder, so for an Annex-B stream the bitparser has already seen the
+keyframe and set m_hasKeyframe when H264Codec::openDecoder() runs.
+openDecoder() then cleared it again, and every following frame was
+dropped as "waiting for keyframe (bitparser)" until the next keyframe.
+
+With a broadcast stream that only costs one GOP. An AirPlay screen
+mirroring sender sends a keyframe at the start of a session and then
+none while the screen does not change, so no picture ever appeared.
+
+openDecoder() is only called from AddData(), after prepareFrame() has
+accepted a keyframe, so leave m_hasKeyframe alone there. reset() still
+clears it. avcC streams go through CBitstreamConverter and are not
+affected.
+---
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp
+index 09e9342..335c335 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/amlogic/H264Codec.cpp
+@@ -185,7 +185,8 @@ CDVDVideoCodec::VCReturn H264Codec::getPicture(VideoPicture *pVideoPicture)
+ bool H264Codec::openDecoder(CDVDStreamInfo &hints)
+ {
+ 	if (AMLInsecureVideoCodec::openDecoder(hints)) {
+-		m_hasKeyframe = false;
++		// The decoder is only opened once prepareFrame() has accepted a keyframe,
++		// so keep m_hasKeyframe: clearing it here drops every frame until the next one.
+ 		return true;
+ 	}
+ 
