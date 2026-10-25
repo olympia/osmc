@@ -1,0 +1,24 @@
+From c9e8fe14fad15dd3c161ad63112524dd192bcb0c Mon Sep 17 00:00:00 2001
+From: CrystalP <crystalp@kodi.tv>
+Date: Sun, 2 Aug 2026 00:16:05 -0400
+Subject: [PATCH] [Utils] Fix path to archive cache
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero3 build from
+xbmc/xbmc#28673 (249a7b7b).
+---
+ xbmc/Util.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/xbmc/Util.cpp b/xbmc/Util.cpp
+index b348084..44faa3c 100644
+--- a/xbmc/Util.cpp
++++ b/xbmc/Util.cpp
+@@ -1419,7 +1419,7 @@ void CUtil::DeleteVideoDatabaseDirectoryCache()
+ 
+ void CUtil::DeleteDirectoryCache(const std::string &prefix)
+ {
+-  std::string searchPath = "special://temp/";
++  std::string searchPath = "special://temp/archive_cache/";
+   CFileItemList items;
+   if (!XFILE::CDirectory::GetDirectory(searchPath, items, ".fi", DIR_FLAG_NO_FILE_DIRS))
+     return;

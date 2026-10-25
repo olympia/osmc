@@ -1,0 +1,285 @@
+From 18d58053a9dd6ca1c0a55a5f2379d72f752d6047 Mon Sep 17 00:00:00 2001
+From: Chris <meischris39@hotmail.com>
+Date: Mon, 7 Sep 2026 09:53:14 +0100
+Subject: [PATCH] Stop a thread translating an info string crashing another
+ reading one
+
+m_multiInfo is a vector that only ever grows, indexed by every caller
+that resolves a multi-info id, and it is guarded by nothing. The lock
+the class already has covers m_bools and m_skinVariableStrings, not
+this.
+
+Both halves of the Python getInfoLabel path are unsynchronised:
+TranslateString may append a block the skin has not asked for before,
+and GetImage then indexes the vector. Every reader binds a *reference*
+into it and copies from that. When an append reallocates in between,
+the reference is left pointing at freed storage and copying the block's
+std::string member dereferences whatever is there -- a segfault inside
+_M_construct, several frames below getInfoLabel, in code that looks
+entirely innocent.
+
+Two service add-ons polling labels while the GUI thread renders is
+enough. The window is a few instructions wide, which is why it presents
+as a rare unexplained crash rather than anything reproducible.
+
+Readers take a copy under a new lock of its own rather than sharing the
+bools lock, which is held across expression parsing. The accessor bounds
+checks as well: an id inside the multi-info range is no promise a block was
+registered for it, since the range is far wider than the vector and
+ResolveMultiInfo feeds a block's own data back in as the next id.
+
+Resolving an id chain asks only for the info number, rather than copying each
+block's strings once per step.
+
+m_skinVariableStrings has the same fault and the same cause. Registering a
+skin variable appends to it, while GetSkinVariableString indexed it and ran
+GetValue() on the element in place, and TranslateSkinVariableString walked it
+with no lock at all, so a $VAR[] label was reachable by the same crash.
+Readers copy the entry out under m_critInfo and evaluate the copy.
+
+The copy is not held under the lock because evaluating a variable reaches back
+into the manager, and the render thread takes m_critInfo through
+GetSkinVariableString while holding GUI locks. It is a copy rather than a
+shared pointer because sharing one instance would leave the GUI thread and a
+getInfoLabel() caller both writing CGUIInfoLabel's mutable m_dirty, m_label
+and m_fallback while evaluating it. The copy costs that label's caches, which
+is the cheaper of the two.
+
+The conditions are still shared, so InfoBool's own cached state races as it
+does today. That predates this and applies to every conditional rather than
+$VAR[] alone, so it wants fixing in InfoBool.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero3 build from
+xbmc/xbmc#29235 (864cb9b8). Omega's CGUIInfo has no GetInfo(), so m_info
+is used, and the locks use the explicit std::unique_lock<CCriticalSection>
+form of the file.
+
+Also initialise m_data2 in the CGUIInfo(info, data3, data5) constructor.
+Omega leaves it indeterminate while operator== compares it, so the dedup in
+AddMultiInfo could miss for two-parameter Addon.* labels and grow
+m_multiInfo on every call. Master no longer has this problem.
+---
+ xbmc/GUIInfoManager.cpp       | 57 +++++++++++++++++++++++++++--------
+ xbmc/GUIInfoManager.h         | 21 ++++++++++++-
+ xbmc/guilib/guiinfo/GUIInfo.h |  2 +-
+ 3 files changed, 66 insertions(+), 14 deletions(-)
+
+diff --git a/xbmc/GUIInfoManager.cpp b/xbmc/GUIInfoManager.cpp
+index b54aebd1..4142c68b 100644
+--- a/xbmc/GUIInfoManager.cpp
++++ b/xbmc/GUIInfoManager.cpp
+@@ -40,6 +40,7 @@
+ #include <iterator>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ 
+ using namespace KODI::GUILIB;
+ using namespace KODI::GUILIB::GUIINFO;
+@@ -10808,7 +10809,7 @@ std::string CGUIInfoManager::GetLabel(int info, int contextWindow, std::string *
+   }
+   else if (info >= MULTI_INFO_START && info <= MULTI_INFO_END)
+   {
+-    return GetMultiInfoLabel(m_multiInfo[info - MULTI_INFO_START], contextWindow);
++    return GetMultiInfoLabel(GetMultiInfo(info), contextWindow);
+   }
+   else if (info >= LISTITEM_START && info <= LISTITEM_END)
+   {
+@@ -10826,7 +10827,7 @@ bool CGUIInfoManager::GetInt(int &value, int info, int contextWindow, const CGUI
+ {
+   if (info >= MULTI_INFO_START && info <= MULTI_INFO_END)
+   {
+-    return GetMultiInfoInt(value, m_multiInfo[info - MULTI_INFO_START], contextWindow, item);
++    return GetMultiInfoInt(value, GetMultiInfo(info), contextWindow, item);
+   }
+   else if (info >= LISTITEM_START && info <= LISTITEM_END)
+   {
+@@ -10898,7 +10899,7 @@ bool CGUIInfoManager::GetBool(int condition1, int contextWindow, const CGUIListI
+   }
+   else if (condition >= MULTI_INFO_START && condition <= MULTI_INFO_END)
+   {
+-    bReturn = GetMultiInfoBool(m_multiInfo[condition - MULTI_INFO_START], contextWindow, item);
++    bReturn = GetMultiInfoBool(GetMultiInfo(condition), contextWindow, item);
+   }
+   else if (!m_infoProviders.GetBool(bReturn, m_currentFile, contextWindow, CGUIInfo(condition)))
+   {
+@@ -10965,7 +10966,7 @@ bool CGUIInfoManager::GetMultiInfoBool(const CGUIInfo &info, int contextWindow,
+               int iResolvedInfo2 = ResolveMultiInfo(info2);
+               if (iResolvedInfo2 != 0)
+               {
+-                const GUIINFO::CGUIInfo& resolvedInfo2 = m_multiInfo[iResolvedInfo2 - MULTI_INFO_START];
++                const GUIINFO::CGUIInfo resolvedInfo2 = GetMultiInfo(iResolvedInfo2);
+                 if (resolvedInfo2.GetInfoFlag() & INFOFLAG_LISTITEM_CONTAINER)
+                   item2 = GUIINFO::GetCurrentListItem(contextWindow, resolvedInfo2.GetData1()); // data1 contains the container id
+               }
+@@ -11136,7 +11137,7 @@ std::string CGUIInfoManager::GetImage(int info, int contextWindow, std::string *
+   }
+   else if (info >= MULTI_INFO_START && info <= MULTI_INFO_END)
+   {
+-    return GetMultiInfoLabel(m_multiInfo[info - MULTI_INFO_START], contextWindow, fallback);
++    return GetMultiInfoLabel(GetMultiInfo(info), contextWindow, fallback);
+   }
+   else if (info == LISTITEM_THUMB ||
+            info == LISTITEM_ICON ||
+@@ -11230,6 +11231,7 @@ void CGUIInfoManager::UpdateAVInfo()
+ 
+ int CGUIInfoManager::AddMultiInfo(const CGUIInfo &info)
+ {
++  std::unique_lock<CCriticalSection> lock(m_critMultiInfo);
+   // check to see if we have this info already
+   for (unsigned int i = 0; i < m_multiInfo.size(); ++i)
+     if (m_multiInfo[i] == info)
+@@ -11242,6 +11244,26 @@ int CGUIInfoManager::AddMultiInfo(const CGUIInfo &info)
+   return id;
+ }
+ 
++int CGUIInfoManager::GetMultiInfoValue(int id) const
++{
++  std::unique_lock<CCriticalSection> lock(m_critMultiInfo);
++  const size_t index = static_cast<size_t>(id) - MULTI_INFO_START;
++  if (index >= m_multiInfo.size())
++    return 0;
++  return m_multiInfo[index].m_info;
++}
++
++CGUIInfo CGUIInfoManager::GetMultiInfo(int id) const
++{
++  std::unique_lock<CCriticalSection> lock(m_critMultiInfo);
++  const size_t index = static_cast<size_t>(id) - MULTI_INFO_START;
++  // Guards an id AddMultiInfo never returned: the range is wider than the
++  // vector, and ResolveMultiInfo() feeds a block's own data back in as an id.
++  if (index >= m_multiInfo.size())
++    return CGUIInfo(0); // no info, which every provider declines
++  return m_multiInfo[index];
++}
++
+ int CGUIInfoManager::ResolveMultiInfo(int info) const
+ {
+   int iLastInfo = 0;
+@@ -11250,7 +11272,7 @@ int CGUIInfoManager::ResolveMultiInfo(int info) const
+   while (iResolvedInfo >= MULTI_INFO_START && iResolvedInfo <= MULTI_INFO_END)
+   {
+     iLastInfo = iResolvedInfo;
+-    iResolvedInfo = m_multiInfo[iResolvedInfo - MULTI_INFO_START].m_info;
++    iResolvedInfo = GetMultiInfoValue(iResolvedInfo);
+   }
+ 
+   return iLastInfo;
+@@ -11260,7 +11282,7 @@ bool CGUIInfoManager::IsListItemInfo(int info) const
+ {
+   int iResolvedInfo = info;
+   while (iResolvedInfo >= MULTI_INFO_START && iResolvedInfo <= MULTI_INFO_END)
+-    iResolvedInfo = m_multiInfo[iResolvedInfo - MULTI_INFO_START].m_info;
++    iResolvedInfo = GetMultiInfoValue(iResolvedInfo);
+ 
+   return (iResolvedInfo >= LISTITEM_START && iResolvedInfo <= LISTITEM_END);
+ }
+@@ -11293,7 +11315,7 @@ std::string CGUIInfoManager::GetMultiInfoItemLabel(const CFileItem *item, int co
+   }
+   else if (info.m_info >= MULTI_INFO_START && info.m_info <= MULTI_INFO_END)
+   {
+-    return GetMultiInfoItemLabel(item, contextWindow, m_multiInfo[info.m_info - MULTI_INFO_START], fallback);
++    return GetMultiInfoItemLabel(item, contextWindow, GetMultiInfo(info.m_info), fallback);
+   }
+   else if (!m_infoProviders.GetLabel(value, item, contextWindow, info, fallback))
+   {
+@@ -11417,7 +11439,7 @@ std::string CGUIInfoManager::GetMultiInfoItemImage(const CFileItem *item, int co
+   }
+   else if (info.m_info >= MULTI_INFO_START && info.m_info <= MULTI_INFO_END)
+   {
+-    return GetMultiInfoItemImage(item, contextWindow, m_multiInfo[info.m_info - MULTI_INFO_START], fallback);
++    return GetMultiInfoItemImage(item, contextWindow, GetMultiInfo(info.m_info), fallback);
+   }
+ 
+   return GetMultiInfoItemLabel(item, contextWindow, info, fallback);
+@@ -11508,6 +11530,8 @@ int CGUIInfoManager::RegisterSkinVariableString(const CSkinVariableString* info)
+ 
+ int CGUIInfoManager::TranslateSkinVariableString(const std::string& name, int context)
+ {
++  std::unique_lock<CCriticalSection> lock(m_critInfo);
++
+   for (std::vector<CSkinVariableString>::const_iterator it = m_skinVariableStrings.begin();
+        it != m_skinVariableStrings.end(); ++it)
+   {
+@@ -11523,10 +11547,19 @@ std::string CGUIInfoManager::GetSkinVariableString(int info,
+                                                    const CGUIListItem* item /*= nullptr*/) const
+ {
+   info -= CONDITIONAL_LABEL_START;
+-  if (info >= 0 && info < static_cast<int>(m_skinVariableStrings.size()))
+-    return m_skinVariableStrings[info].GetValue(contextWindow, preferImage, item);
+ 
+-  return "";
++  std::optional<CSkinVariableString> variable;
++  {
++    std::unique_lock<CCriticalSection> lock(m_critInfo);
++    if (info < 0 || info >= static_cast<int>(m_skinVariableStrings.size()))
++      return "";
++
++    variable = m_skinVariableStrings[info];
++  }
++
++  // Evaluated on the copy, with the lock let go. A skin variable may hold
++  // another, so this reaches back into the manager before it returns.
++  return variable->GetValue(contextWindow, preferImage, item);
+ }
+ 
+ bool CGUIInfoManager::ConditionsChangedValues(const std::map<INFO::InfoPtr, bool>& map)
+diff --git a/xbmc/GUIInfoManager.h b/xbmc/GUIInfoManager.h
+index 4c5fd708..c47f3c99 100644
+--- a/xbmc/GUIInfoManager.h
++++ b/xbmc/GUIInfoManager.h
+@@ -206,6 +206,24 @@ private:
+ 
+   int AddMultiInfo(const KODI::GUILIB::GUIINFO::CGUIInfo &info);
+ 
++  /*!
++   \brief One registered multi-info block, by value.
++
++   A reference into m_multiInfo cannot be held: any thread translating an info
++   string it has not seen before appends to the vector, and the reallocation
++   that follows frees what the reference points at. Callers get a copy taken
++   under the lock instead.
++   */
++  KODI::GUILIB::GUIINFO::CGUIInfo GetMultiInfo(int id) const;
++
++  /*!
++   \brief The info number of one registered multi-info block.
++
++   For callers that resolve an id and want nothing else from the block, which
++   would otherwise copy its strings once per step of the chain.
++   */
++  int GetMultiInfoValue(int id) const;
++
+   int ResolveMultiInfo(int info) const;
+   bool IsListItemInfo(int info) const;
+ 
+@@ -214,6 +232,7 @@ private:
+ 
+   // Vector of multiple information mapped to a single integer lookup
+   std::vector<KODI::GUILIB::GUIINFO::CGUIInfo> m_multiInfo;
++  mutable CCriticalSection m_critMultiInfo;
+ 
+   // Current playing stuff
+   CFileItem* m_currentFile;
+@@ -223,7 +242,7 @@ private:
+   unsigned int m_refreshCounter = 0;
+   std::vector<INFO::CSkinVariableString> m_skinVariableStrings;
+ 
+-  CCriticalSection m_critInfo;
++  mutable CCriticalSection m_critInfo;
+ 
+   KODI::GUILIB::GUIINFO::CGUIInfoProviders m_infoProviders;
+ };
+diff --git a/xbmc/guilib/guiinfo/GUIInfo.h b/xbmc/guilib/guiinfo/GUIInfo.h
+index c5bffe87..113936bd 100644
+--- a/xbmc/guilib/guiinfo/GUIInfo.h
++++ b/xbmc/guilib/guiinfo/GUIInfo.h
+@@ -77,7 +77,7 @@ public:
+   }
+ 
+   CGUIInfo(int info, const std::string& data3, const std::string& data5)
+-    : m_info(info), m_data1(0), m_data3(data3), m_data4(0), m_data5(data5)
++    : m_info(info), m_data1(0), m_data2(0), m_data3(data3), m_data4(0), m_data5(data5)
+   {
+   }
+ 

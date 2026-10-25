@@ -1,0 +1,106 @@
+From 6b6de97046dd267b3ebc9cbe761846a93782ded4 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Mon, 19 Oct 2026 06:55:20 +0200
+Subject: [PATCH] [TextureCache] Return the cached copy at the requested size
+ on a miss
+
+When the GUI's large texture loader misses the cache and wins the
+caching claim, CacheImage() handed back the job's full resolution decode
+and ignored the requested size. A panel of 24 MP photos could then
+upload a ~93 MiB texture per item, enough to exhaust GPU memory on low
+RAM devices until the OOM killer stepped in.
+
+Load the freshly written cache file at the requested size instead, as
+the waiting branch and the cache hit route already do. No caller wants
+the texture from CTextureCacheJob::CacheTexture() any more, so drop the
+parameter.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero3 build from
+xbmc/xbmc#29970. Omega's CacheImage() has no requested size, so the
+fresh cache file is loaded bounded by the GUI resolution, as the cache
+hit route in CImageLoader::DoWork() does. The waiting branch keeps
+loading at 0, 0.
+---
+ xbmc/TextureCache.cpp    | 14 ++++++++++++--
+ xbmc/TextureCacheJob.cpp |  5 +----
+ xbmc/TextureCacheJob.h   |  2 +-
+ 3 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/TextureCache.cpp b/xbmc/TextureCache.cpp
+index 04e518d2..fa6f2e2c 100644
+--- a/xbmc/TextureCache.cpp
++++ b/xbmc/TextureCache.cpp
+@@ -22,6 +22,8 @@
+ #include "utils/StringUtils.h"
+ #include "utils/URIUtils.h"
+ #include "utils/log.h"
++#include "windowing/GraphicContext.h"
++#include "windowing/WinSystem.h"
+ 
+ #include <chrono>
+ #include <exception>
+@@ -161,11 +163,19 @@ std::string CTextureCache::CacheImage(const std::string& image,
+     lock.unlock();
+     // cache the texture directly
+     CTextureCacheJob job(url);
+-    bool success = job.CacheTexture(texture);
++    bool success = job.CacheTexture();
+     OnCachingComplete(success, &job);
+     if (success && details)
+       *details = job.m_details;
+-    return success ? GetCachedPath(job.m_details.file) : "";
++    if (!success)
++      return "";
++
++    const std::string cachedPath = GetCachedPath(job.m_details.file);
++    if (texture)
++      *texture = CTexture::LoadFromFile(
++          cachedPath, CServiceBroker::GetWinSystem()->GetGfxContext().GetWidth(),
++          CServiceBroker::GetWinSystem()->GetGfxContext().GetHeight());
++    return cachedPath;
+   }
+   lock.unlock();
+ 
+diff --git a/xbmc/TextureCacheJob.cpp b/xbmc/TextureCacheJob.cpp
+index 2850046e..bc6fe735 100644
+--- a/xbmc/TextureCacheJob.cpp
++++ b/xbmc/TextureCacheJob.cpp
+@@ -28,7 +28,6 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <exception>
+-#include <utility>
+ 
+ #include "PlatformDefs.h"
+ 
+@@ -100,7 +99,7 @@ bool ShouldCheckForChanges(const std::string& additional_info, const std::string
+ }
+ } // namespace
+ 
+-bool CTextureCacheJob::CacheTexture(std::unique_ptr<CTexture>* out_texture)
++bool CTextureCacheJob::CacheTexture()
+ {
+   // unwrap the URL as required
+   std::string additional_info;
+@@ -140,8 +139,6 @@ bool CTextureCacheJob::CacheTexture(std::unique_ptr<CTexture>* out_texture)
+     {
+       m_details.width = width;
+       m_details.height = height;
+-      if (out_texture) // caller wants the texture
+-        *out_texture = std::move(texture);
+       return true;
+     }
+   }
+diff --git a/xbmc/TextureCacheJob.h b/xbmc/TextureCacheJob.h
+index 8d7b764c..d3b896c8 100644
+--- a/xbmc/TextureCacheJob.h
++++ b/xbmc/TextureCacheJob.h
+@@ -63,7 +63,7 @@ public:
+    \param url location of the image
+    \return a hash string for this image
+    */
+-  bool CacheTexture(std::unique_ptr<CTexture>* texture = nullptr);
++  bool CacheTexture();
+ 
+   static bool ResizeTexture(const std::string &url, uint8_t* &result, size_t &result_size);
+ 

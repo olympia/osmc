@@ -354,7 +354,7 @@ then
 	fi
 	if [ "$1" == "vero3" ]
 	then
-	   ADDONS_TO_BUILD="${ALL}"
+	   ADDONS_TO_BUILD="${ALL} inputstream.airplay"
            echo "set(APP_RENDER_SYSTEM gles)" >> ../Toolchain.mk
            echo "set(OPENGLES_gl_LIBRARY /opt/vero3/lib/libEGL.so)" >> ../Toolchain.mk
            echo "set(OPENGLES_INCLUDE_DIR /opt/vero3/include)" >> ../Toolchain.mk
@@ -368,7 +368,7 @@ then
         fi
         cmake -DOVERRIDE_PATHS=1 -DCMAKE_INSTALL_PREFIX=${out}/usr/ -DBUILD_DIR=$(pwd) -DADDONS_TO_BUILD="${ADDONS_TO_BUILD}" -DCMAKE_TOOLCHAIN_FILE=../Toolchain.mk ../
         if [ $? != 0 ]; then echo "Configuring binary addons failed" && exit 1; fi
-        if [ "$1" == "vero5" ]
+        if [ "$1" == "vero3" ] || [ "$1" == "vero5" ]
         then
            # inputstream.airplay is not in repo-binary-addons. Add its definition
            # only after the first configure has bootstrapped the others: with any

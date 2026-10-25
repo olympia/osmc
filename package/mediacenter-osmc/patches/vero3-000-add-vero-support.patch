@@ -8629,7 +8629,7 @@ index cf7cd1be79..8f104967fc 100644
  
    /* IMenus */
    void ActivateButton() override { UserInput(BD_VK_ENTER); }
-@@ -184,9 +193,15 @@ protected:
+@@ -186,12 +195,18 @@ protected:
      bool OpenStream(CFileItem &item);
      void SetupPlayerSettings();
      void FreeTitleInfo();
@@ -8640,10 +8640,13 @@ index cf7cd1be79..8f104967fc 100644
  
      /*! Bluray state serializer handler */
      CBlurayStateSerializer m_blurayStateSerializer;
-+
+
 +    /* BD3D related things */
-+    CDVDInputStreamBlurayExtension	*m_extension;
++    CDVDInputStreamBlurayExtension     *m_extension;
 +    bool m_flipEyes;
++
+     /* used during bd_open_stream read block*/
+     CCriticalSection m_readBlocksLock;
  };
 diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBlurayExtension.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBlurayExtension.cpp
 new file mode 100644
@@ -9940,10 +9943,10 @@ index 54f0524848..ae9ec99dc1 100644
  #define CONF_FLAGS_STEREO_CADENCE(a) ((a) & 0x008000)
  #define CONF_FLAGS_STEREO_CADANCE_LEFT_RIGHT 0x000000
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
-index 67b55982ec..6ee92c69e6 100644
+index 51bbbc514a..17224fd135 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
-@@ -27,6 +27,8 @@
+@@ -26,6 +26,8 @@
  #include "utils/log.h"
  #include "windowing/GraphicContext.h"
  #include "windowing/WinSystem.h"
@@ -9952,32 +9955,35 @@ index 67b55982ec..6ee92c69e6 100644
  
  #include <memory>
  #include <mutex>
-@@ -693,7 +695,11 @@ RESOLUTION CRenderManager::GetResolution()
+@@ -680,8 +682,12 @@ RESOLUTION CRenderManager::GetResolution()
      return res;
  
    if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF)
--    res = CResolutionUtils::ChooseBestResolution(m_fps, m_width, m_height, !m_stereomode.empty());
+-    res = CResolutionUtils::ChooseBestResolution(m_fps, m_picture.iWidth, m_picture.iHeight,
+-                                                 !m_picture.stereoMode.empty());
++
 +  {
 +    RENDER_STEREO_MODE rsm = CServiceBroker::GetGUI()->GetStereoscopicsManager().GetStereoMode();
 +    uint32_t mode3dFlags = CServiceBroker::GetWinSystem()->GetGfxContext().ConvertRenderStereoModeToMode3dFlags(rsm);
-+    res = CResolutionUtils::ChooseBestResolution(m_fps, m_width, m_height, mode3dFlags);
++    res = CResolutionUtils::ChooseBestResolution(m_fps, m_picture.iWidth, m_picture.iHeight, mode3dFlags);
 +  }
  
    return res;
  }
-@@ -896,7 +902,10 @@ void CRenderManager::UpdateResolution()
+@@ -884,8 +890,10 @@ void CRenderManager::UpdateResolution()
      {
        if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF && m_fps > 0.0f)
        {
--        RESOLUTION res = CResolutionUtils::ChooseBestResolution(m_fps, m_width, m_height, !m_stereomode.empty());
+-        RESOLUTION res = CResolutionUtils::ChooseBestResolution(
+-            m_fps, m_picture.iWidth, m_picture.iHeight, !m_picture.stereoMode.empty());
 +        RENDER_STEREO_MODE rsm = CServiceBroker::GetGUI()->GetStereoscopicsManager().GetStereoMode();
 +        uint32_t mode3dFlags = CServiceBroker::GetWinSystem()->GetGfxContext().ConvertRenderStereoModeToMode3dFlags(rsm);
-+        RESOLUTION res = CResolutionUtils::ChooseBestResolution(m_fps, m_width, m_height, mode3dFlags);
++        RESOLUTION res = CResolutionUtils::ChooseBestResolution(m_fps, m_picture.iWidth, m_picture.iHeight, mode3dFlags);
 +
          CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
          UpdateLatencyTweak();
          if (m_pRenderer)
-@@ -1175,10 +1184,9 @@ void CRenderManager::PrepareNextRender()
+@@ -1164,10 +1172,9 @@ void CRenderManager::PrepareNextRender()
    }
  
    CLog::LogFC(LOGDEBUG, LOGAVTIMING,
@@ -9991,7 +9997,7 @@ index 67b55982ec..6ee92c69e6 100644
  
    bool combined = false;
    if (m_presentsourcePast >= 0)
-@@ -1190,41 +1198,26 @@ void CRenderManager::PrepareNextRender()
+@@ -1179,41 +1186,26 @@ void CRenderManager::PrepareNextRender()
  
    if (renderPts >= nextFramePts || m_forceNext)
    {
@@ -10246,18 +10252,18 @@ index 67f3d14875..d2d785ef4c 100644
 \ No newline at end of file
 +}
 diff --git a/xbmc/messaging/ApplicationMessenger.h b/xbmc/messaging/ApplicationMessenger.h
-index b8e731c190..93ccad0d52 100644
+index 53ee579137..5825458464 100644
 --- a/xbmc/messaging/ApplicationMessenger.h
 +++ b/xbmc/messaging/ApplicationMessenger.h
-@@ -92,6 +92,7 @@
- #define TMSG_SET_MUTE                     TMSG_MASK_APPLICATION + 37
+@@ -93,6 +93,7 @@
+ #define TMSG_RESUMEAPP                    TMSG_MASK_APPLICATION + 38
  
- #define TMSG_SETOSMCWALKTHROUGHSTATE      TMSG_MASK_APPLICATION + 38
-+#define TMSG_AML_RESIZE                   TMSG_MASK_APPLICATION + 39
+ #define TMSG_SETOSMCWALKTHROUGHSTATE      TMSG_MASK_APPLICATION + 39
++#define TMSG_AML_RESIZE                   TMSG_MASK_APPLICATION + 40
  
  #define TMSG_GUI_INFOLABEL                TMSG_MASK_GUIINFOMANAGER + 0
  #define TMSG_GUI_INFOBOOL                 TMSG_MASK_GUIINFOMANAGER + 1
-@@ -100,6 +101,7 @@
+@@ -101,6 +102,7 @@
  #define TMSG_CECTOGGLESTATE               TMSG_MASK_PERIPHERALS + 1
  #define TMSG_CECACTIVATESOURCE            TMSG_MASK_PERIPHERALS + 2
  #define TMSG_CECSTANDBY                   TMSG_MASK_PERIPHERALS + 3

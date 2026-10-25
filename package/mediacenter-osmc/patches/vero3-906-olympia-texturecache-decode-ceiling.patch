@@ -1,0 +1,238 @@
+From 4a612b8e00015d9d9a1b0e342be5c7d414219c32 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 11 Oct 2026 13:28:58 +0100
+Subject: [PATCH] TextureCacheJob: load an image only as large as the cache
+ will keep
+
+The caching job decoded every image at its full source resolution,
+bounded only by GL_MAX_TEXTURE_SIZE, although CPicture::CacheTexture()
+never writes out more than imageres/fanartres. Every pixel above that
+ceiling was decoded, held and scaled only to be thrown away, and with
+two caching jobs running at once a folder of camera photos is enough
+to exhaust memory on a small device.
+
+Ask for the ceiling instead. Images at or below it are unaffected,
+since LoadIImage() never scales up.
+
+ResizeTexture(), used by the HTTP image transformation handler, still
+loads at full size, as it is asked for client supplied dimensions.
+
+Clamp the loaded size to at least 1x1, as rounding can otherwise give
+an extremely wide or tall image a zero dimension and fail the load.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero3 build from
+xbmc/xbmc#29992 (f0ab44c). Omega's CTexture::LoadIImage() allocated the
+full image size whatever the caller asked for, so it also takes the
+allocation part of xbmc/xbmc#25630 (7f14fc80, Albert Chang): the texture
+is fitted into the requested maximum, keeping the aspect ratio the way
+CFFmpegImage::DecodeFrame() scales, and smaller images keep their size.
+This applies to FFmpeg decoded images only. The Omega image decoder
+add-ons (raw, mpo, heif) decode at their native size whatever they are
+asked for, so they keep the full size allocation.
+
+The 1x1 clamp is applied both to the allocation and in DecodeFrame(),
+which computes its own size, and DecodeFrame() now fails the load when
+swscale cannot create a context instead of dereferencing it.
+CFFmpegImage::ReadFrame() checks that result too, so an animated image
+stops at a frame that cannot be decoded instead of showing it
+uninitialised.
+
+Omega's LoadImage() already had a size for the special image loaders, so
+the decode limit is passed separately and only reaches
+CTexture::LoadFromFile(). Unlike upstream, a smaller size asked for by
+the URL (size=thumb, width/height) is also used as the decode limit, as
+Omega's cache job has that size at hand.
+
+What the limit saves is the RGBA texture. libavcodec still decodes the
+full resolution frame, about 36-48 MB of YUV for a 24 MP JPEG. An image
+whose decode limit equals the cache size, which is every URL sized image
+and, with fanartres above imageres, every 16:9 image above the ceiling,
+is decoded straight to its target, so imagescalingalgorithm and
+?scaling_algorithm= do not apply to it. Other images above the limit are
+scaled twice. As the 16:9 test of CPicture::CacheTexture() now sees the
+decoded size, an image within rounding of its 1% tolerance can land in
+the other cache size, as upstream. Embedded music and video art without
+a size in the URL still decodes at full size. ResizeTexture() passes
+0, 0 as upstream does.
+
+As LoadIImage() now honours the maximum size of every caller, images
+loaded without the texture cache by the large texture manager (for
+example ControlImage with useCache=False, special://temp, the Thumbnails
+folder, loose resource:// and skin files outside the XBT) are fitted into
+the GUI resolution, and picture folder and PVR channel group tiles and
+sized embedded art decode at their target size. Images larger than the
+maximum texture size get a smaller texture keeping the aspect ratio
+everywhere, the slideshow and skin textures included, instead of being
+clamped per axis. Cached images stay as they are as long as neither
+imageres nor fanartres is above the GUI height.
+---
+ xbmc/TextureCacheJob.cpp    | 19 ++++++++++++++++---
+ xbmc/TextureCacheJob.h      |  4 ++++
+ xbmc/guilib/FFmpegImage.cpp | 19 ++++++++++++++++++-
+ xbmc/guilib/Texture.cpp     | 27 ++++++++++++++++++++++++++-
+ 4 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/xbmc/TextureCacheJob.cpp b/xbmc/TextureCacheJob.cpp
+index bc6fe735..b982a32d 100644
+--- a/xbmc/TextureCacheJob.cpp
++++ b/xbmc/TextureCacheJob.cpp
+@@ -25,6 +25,7 @@
+ #include "utils/URIUtils.h"
+ #include "utils/log.h"
+ 
++#include <algorithm>
+ #include <cstdlib>
+ #include <cstring>
+ #include <exception>
+@@ -123,7 +124,16 @@ bool CTextureCacheJob::CacheTexture()
+     }
+   }
+ 
+-  std::unique_ptr<CTexture> texture = LoadImage(image, width, height, additional_info, true);
++  // CPicture::CacheTexture() will not write out more than imageres/fanartres, so decoding or
++  // holding anything above that ceiling is memory spent on pixels that are discarded
++  const auto advancedSettings = CServiceBroker::GetSettingsComponent()->GetAdvancedSettings();
++  const unsigned int maxHeight =
++      std::max(advancedSettings->m_imageRes, advancedSettings->m_fanartRes);
++  const unsigned int maxWidth = maxHeight * 16 / 9;
++
++  std::unique_ptr<CTexture> texture =
++      LoadImage(image, width, height, width ? std::min(width, maxWidth) : maxWidth,
++                height ? std::min(height, maxHeight) : maxHeight, additional_info, true);
+   if (texture)
+   {
+     if (texture->HasAlpha())
+@@ -161,7 +171,8 @@ bool CTextureCacheJob::ResizeTexture(const std::string &url, uint8_t* &result, s
+   if (image.empty())
+     return false;
+ 
+-  std::unique_ptr<CTexture> texture = LoadImage(image, width, height, additional_info, true);
++  std::unique_ptr<CTexture> texture =
++      LoadImage(image, width, height, 0, 0, additional_info, true);
+   if (texture == NULL)
+     return false;
+ 
+@@ -233,6 +244,8 @@ std::string CTextureCacheJob::DecodeImageURL(const std::string &url, unsigned in
+ std::unique_ptr<CTexture> CTextureCacheJob::LoadImage(const std::string& image,
+                                                       unsigned int width,
+                                                       unsigned int height,
++                                                      unsigned int maxWidth,
++                                                      unsigned int maxHeight,
+                                                       const std::string& additional_info,
+                                                       bool requirePixels)
+ {
+@@ -252,7 +265,7 @@ std::unique_ptr<CTexture> CTextureCacheJob::LoadImage(const std::string& image,
+     return NULL;
+ 
+   std::unique_ptr<CTexture> texture =
+-      CTexture::LoadFromFile(image, width, height, requirePixels, file.GetMimeType());
++      CTexture::LoadFromFile(image, maxWidth, maxHeight, requirePixels, file.GetMimeType());
+   if (!texture)
+     return NULL;
+ 
+diff --git a/xbmc/TextureCacheJob.h b/xbmc/TextureCacheJob.h
+index d3b896c8..c5d61d5c 100644
+--- a/xbmc/TextureCacheJob.h
++++ b/xbmc/TextureCacheJob.h
+@@ -96,12 +96,16 @@ private:
+    \param image the URL of the image file.
+    \param width the desired maximum width.
+    \param height the desired maximum height.
++   \param maxWidth the maximum width to load the image file at, 0 for no limit.
++   \param maxHeight the maximum height to load the image file at, 0 for no limit.
+    \param additional_info extra info for loading, such as whether to flip horizontally.
+    \return a pointer to a CTexture object, NULL if failed.
+    */
+   static std::unique_ptr<CTexture> LoadImage(const std::string& image,
+                                              unsigned int width,
+                                              unsigned int height,
++                                             unsigned int maxWidth,
++                                             unsigned int maxHeight,
+                                              const std::string& additional_info,
+                                              bool requirePixels = false);
+ 
+diff --git a/xbmc/guilib/FFmpegImage.cpp b/xbmc/guilib/FFmpegImage.cpp
+index 33e00a1d..2cf3eb4f 100644
+--- a/xbmc/guilib/FFmpegImage.cpp
++++ b/xbmc/guilib/FFmpegImage.cpp
+@@ -501,9 +501,21 @@ bool CFFmpegImage::DecodeFrame(AVFrame* frame, unsigned int width, unsigned int
+     nWidth = width;
+     nHeight = (unsigned int)(nWidth / ratio + 0.5f);
+   }
++  // rounding can give an extremely wide or tall image a zero dimension, which swscale rejects
++  nWidth = std::max(nWidth, 1u);
++  nHeight = std::max(nHeight, 1u);
+ 
+   struct SwsContext* context = sws_getContext(m_originalWidth, m_originalHeight, pixFormat,
+     nWidth, nHeight, AV_PIX_FMT_RGB32, SWS_BICUBIC, NULL, NULL, NULL);
++  if (!context)
++  {
++    CLog::LogF(LOGERROR, "Could not create a scaling context for {} x {} pixels", nWidth,
++               nHeight);
++    if (!needsCopy)
++      pictureRGB->data[0] = nullptr; // only lent, don't get it deleted
++    av_frame_free(&pictureRGB);
++    return false;
++  }
+ 
+   if (range == AVCOL_RANGE_JPEG)
+   {
+@@ -771,7 +783,12 @@ std::shared_ptr<Frame> CFFmpegImage::ReadFrame()
+ 
+   frame->m_pitch = avframe->width * 4;
+   frame->m_pImage = (unsigned char*) av_malloc(avframe->height * frame->m_pitch);
+-  DecodeFrame(avframe, avframe->width, avframe->height, frame->m_pitch, frame->m_pImage);
++  if (!frame->m_pImage ||
++      !DecodeFrame(avframe, avframe->width, avframe->height, frame->m_pitch, frame->m_pImage))
++  {
++    av_frame_free(&avframe);
++    return nullptr;
++  }
+   av_frame_free(&avframe);
+   return frame;
+ }
+diff --git a/xbmc/guilib/Texture.cpp b/xbmc/guilib/Texture.cpp
+index cfc506d4..1b41c0cc 100644
+--- a/xbmc/guilib/Texture.cpp
++++ b/xbmc/guilib/Texture.cpp
+@@ -15,6 +15,7 @@
+ #include "filesystem/File.h"
+ #include "filesystem/ResourceFile.h"
+ #include "filesystem/XbtFile.h"
++#include "guilib/FFmpegImage.h"
+ #include "guilib/iimage.h"
+ #include "guilib/imagefactory.h"
+ #include "utils/URIUtils.h"
+@@ -336,7 +337,31 @@ bool CTexture::LoadIImage(IImage* pImage,
+   {
+     if (pImage->Width() > 0 && pImage->Height() > 0)
+     {
+-      Allocate(pImage->Width(), pImage->Height(), XB_FMT_A8R8G8B8);
++      unsigned int allocWidth = pImage->Width();
++      unsigned int allocHeight = pImage->Height();
++      // Allocate only as large as the caller asked for, keeping the aspect ratio, the same
++      // way CFFmpegImage::DecodeFrame() scales, so a large source no longer needs a full size
++      // texture. Image decoder add-ons decode at their native size whatever they are asked
++      // for, so they keep the full size allocation.
++      if (dynamic_cast<CFFmpegImage*>(pImage) != nullptr)
++      {
++        const float ratio = static_cast<float>(pImage->Width()) / pImage->Height();
++        if (allocHeight > height)
++        {
++          allocHeight = height;
++          allocWidth = static_cast<unsigned int>(allocHeight * ratio + 0.5f);
++        }
++        if (allocWidth > width)
++        {
++          allocWidth = width;
++          allocHeight = static_cast<unsigned int>(allocWidth / ratio + 0.5f);
++        }
++        // rounding can give an extremely wide or tall image a zero dimension
++        allocWidth = std::max(allocWidth, 1u);
++        allocHeight = std::max(allocHeight, 1u);
++      }
++
++      Allocate(allocWidth, allocHeight, XB_FMT_A8R8G8B8);
+       if (m_pixels != nullptr && pImage->Decode(m_pixels, GetTextureWidth(), GetRows(), GetPitch(), XB_FMT_A8R8G8B8))
+       {
+         if (pImage->Orientation())

@@ -1,0 +1,72 @@
+From 7663d2295118a583cf3a52f88fd13141456ade44 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Wed, 30 Sep 2026 20:46:17 +0200
+Subject: [PATCH] [Backport][Video][Database] Fix movie search results matched
+ by original title.
+
+#18460 added the original title to the movie search query but left the
+result list building its label from the localised title alone, so the
+feature it added only half works: the query finds the movie, then offers
+it back under a name the user did not type and may not know. With several
+matches there is nothing to tell them apart by.
+
+Append the original title to the label when the title did not match. The
+query reports which field matched, so this follows the active database's
+own matching semantics: MySQL tables use utf8mb4_general_ci, which folds
+accents, while a C++ substring test would not.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero3 build from
+xbmc/xbmc#29638.
+---
+ xbmc/video/VideoDatabase.cpp | 26 ++++++++++++++++++++------
+ 1 file changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/xbmc/video/VideoDatabase.cpp b/xbmc/video/VideoDatabase.cpp
+index 25cc6f04..846f190f 100644
+--- a/xbmc/video/VideoDatabase.cpp
++++ b/xbmc/video/VideoDatabase.cpp
+@@ -9541,16 +9541,20 @@ void CVideoDatabase::GetMoviesByName(const std::string& strSearch, CFileItemList
+       return;
+ 
+     if (m_profileManager.GetMasterProfile().getLockMode() != LOCK_MODE_EVERYONE && !g_passwordManager.bMasterUser)
+-      strSQL = PrepareSQL("SELECT movie.idMovie, movie.c%02d, path.strPath, movie.idSet FROM movie "
++      strSQL = PrepareSQL("SELECT movie.idMovie, movie.c%02d, movie.c%02d, "
++                          "movie.c%02d LIKE '%%%s%%', path.strPath, movie.idSet FROM movie "
+                           "INNER JOIN files ON files.idFile=movie.idFile INNER JOIN path ON "
+                           "path.idPath=files.idPath "
+                           "WHERE movie.c%02d LIKE '%%%s%%' OR movie.c%02d LIKE '%%%s%%'",
+-                          VIDEODB_ID_TITLE, VIDEODB_ID_TITLE, strSearch.c_str(),
++                          VIDEODB_ID_TITLE, VIDEODB_ID_ORIGINALTITLE, VIDEODB_ID_TITLE,
++                          strSearch.c_str(), VIDEODB_ID_TITLE, strSearch.c_str(),
+                           VIDEODB_ID_ORIGINALTITLE, strSearch.c_str());
+     else
+-      strSQL = PrepareSQL("SELECT movie.idMovie,movie.c%02d, movie.idSet FROM movie WHERE "
+-                          "movie.c%02d like '%%%s%%' OR movie.c%02d LIKE '%%%s%%'",
+-                          VIDEODB_ID_TITLE, VIDEODB_ID_TITLE, strSearch.c_str(),
++      strSQL = PrepareSQL("SELECT movie.idMovie,movie.c%02d, movie.c%02d, "
++                          "movie.c%02d LIKE '%%%s%%', movie.idSet FROM movie "
++                          "WHERE movie.c%02d like '%%%s%%' OR movie.c%02d LIKE '%%%s%%'",
++                          VIDEODB_ID_TITLE, VIDEODB_ID_ORIGINALTITLE, VIDEODB_ID_TITLE,
++                          strSearch.c_str(), VIDEODB_ID_TITLE, strSearch.c_str(),
+                           VIDEODB_ID_ORIGINALTITLE, strSearch.c_str());
+     m_pDS->query( strSQL );
+ 
+@@ -9565,7 +9569,17 @@ void CVideoDatabase::GetMoviesByName(const std::string& strSearch, CFileItemList
+ 
+       int movieId = m_pDS->fv("movie.idMovie").get_asInt();
+       int setId = m_pDS->fv("movie.idSet").get_asInt();
+-      CFileItemPtr pItem(new CFileItem(m_pDS->fv(1).get_asString()));
++      const std::string title = m_pDS->fv(1).get_asString();
++      const std::string originalTitle = m_pDS->fv(2).get_asString();
++      // The query reports whether the title matched, so this follows the
++      // database's own matching semantics rather than a separate C++ test.
++      const bool titleMatched = m_pDS->fv(3).get_asBool();
++      // Append the original title when the row matched on it alone, otherwise
++      // the result is not identifiable to a user who searched by that title.
++      std::string label = title;
++      if (!titleMatched && !originalTitle.empty())
++        label = StringUtils::Format("{} ({})", title, originalTitle);
++      CFileItemPtr pItem(new CFileItem(label));
+       std::string path;
+       if (setId <= 0 || !CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(CSettings::SETTING_VIDEOLIBRARY_GROUPMOVIESETS))
+         path = StringUtils::Format("videodb://movies/titles/{}", movieId);

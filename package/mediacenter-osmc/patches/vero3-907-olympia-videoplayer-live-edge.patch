@@ -1,0 +1,280 @@
+From 26374ebe197dff481944b135c80cc1a49a16d215 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Tue, 25 Aug 2026 13:19:16 +0100
+Subject: [PATCH] VideoPlayer: let a live stream start and stay at its live
+ edge
+
+The clock for a stream is started from the first frame that decodes. For a
+real time stream that turns however long the stream players took to get
+going into a presentation latency lasting the whole session: the source
+keeps producing in real time, so the player stays exactly as far behind as
+it was when it started, and nothing brings it back.
+
+Two things feed that delay and they trade off against each other, so
+neither is small. Waiting for the first picture to decode took between
+0.45s and 1.3s in testing, varying with how fast frames arrive; and where
+an audio stream is present the clock is additionally started cachetotal +
+400ms behind, which is 0.74s with an audio sink reporting 800ms. Screen
+mirroring measured 1.3-1.6s of latency inside the player as a result.
+
+Add INPUTSTREAM_LOW_LATENCY_LIVE so a source can say it would rather be
+close to live than keep that buffer. When set, sync starts the clock from
+the newest timestamp demuxed rather than the first one decoded, and the
+frames queued ahead of it are dropped as late.
+
+Off unless asked for: the delay is a jitter buffer, and for broadcast
+sources it is doing useful work. It is worth trading only where being close
+to the source is the point, as it is for a mirrored screen.
+
+Starting there is not enough on its own, because three things then give the
+latency back over the life of a session.
+
+A stall is taken to mean the source is in trouble, and the player buffers
+until it refills. For a source that asked to stay at the live edge that is
+the wrong trade twice over: the gap is usually just the source having
+nothing new to send -- a mirrored screen that no one is touching sends
+nothing at all -- and the pause is time it can never win back, so every one
+of them is added to the delay for the rest of the session. Two seconds of
+buffering measured on a mirroring session became two seconds of permanent
+latency. Treat it the way a menu or a still image is already treated: a
+stall is not news, so leave the clock running and carry on when there is
+something to show.
+
+A live stream whose audio queue runs low has the clock slowed by 5% to give
+it a chance to refill, and that is undone when the queue recovers past a
+threshold. Both halves sit behind a test for the audio stream existing, so
+a stream that disappears mid-playback -- an inputstream withdrawing a track
+that has gone silent, for one -- leaves the clock slowed with nothing able
+to restore it. It then falls 50ms further behind the source every second
+for the rest of the session, which for a live source it can never make
+back. Restore normal speed when the branch that would otherwise undo it no
+longer runs. The same reasoning covers passthrough, which is excluded just
+above because its queue level never rises far enough to trigger the
+restore.
+
+And the margin left in hand at the start was a fixed 100ms, which is a
+guess: how much room a source needs depends on how evenly it arrives, and
+there is no single answer. A screen being mirrored delivers video steadily
+but sound only while there is a sound to send, so it turns up in bursts of
+a couple of hundred milliseconds -- more than the margin, so the audio
+engine resamples it back into place every few seconds and every correction
+is audible. Take the value from the stream instead, as a listitem property,
+defaulting to the 100ms used until now. A property rather than a new call:
+the function table is allocated by Kodi, so adding to it breaks any add-on
+built against a newer header than the running build, and a name costs
+nothing.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero3 build from
+popcornmix/xbmc@e18e062e5 (branch airplay). Omega's CDVDInputStream has no
+IsStreaming(), so the new accessors follow IsRealtime(), and the header
+includes <chrono> itself. The inputstream API version stays at 3.3.0: the
+flag and the stream property only add to it. The passthrough remark above
+does not apply here: Omega has no passthrough exclusion in that block, so
+the restore only covers a real time stream whose audio stream has gone
+away.
+---
+ .../kodi/c-api/addon-instance/inputstream.h   | 14 ++++++
+ .../inputstream/stream_constants.h            |  9 ++++
+ .../DVDInputStreams/DVDInputStream.cpp        |  2 +
+ .../DVDInputStreams/DVDInputStream.h          | 17 +++++++
+ .../DVDInputStreams/InputStreamAddon.cpp      |  5 +++
+ .../DVDInputStreams/InputStreamAddon.h        |  1 +
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        | 45 +++++++++++++++++--
+ 7 files changed, 90 insertions(+), 3 deletions(-)
+
+diff --git a/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream.h b/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream.h
+index 7e33015..4f8d66b 100644
+--- a/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream.h
++++ b/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream.h
+@@ -84,6 +84,20 @@ extern "C"
+     ///
+     /// If set must be @ref cpp_kodi_addon_inputstream_Chapter "Chapter support" included.
+     INPUTSTREAM_SUPPORTS_ICHAPTER = (1 << 6),
++
++    /// @brief **0000 0000 1000 0000 :** Stream should start at the live edge.
++    ///
++    /// Only meaningful together with
++    /// @ref kodi::addon::CInstanceInputStream::IsRealTimeStream().
++    ///
++    /// A real time stream is normally started on the first frame that decodes,
++    /// which leaves the player however long it took to get going permanently
++    /// behind the source, as a live stream never catches back up. Set this for
++    /// a stream where being close to the source matters more than the buffer
++    /// that delay provides, such as screen mirroring: the player then starts
++    /// at the newest timestamp it has and discards what was queued ahead of
++    /// it, at the cost of a shorter safety margin against a stalling source.
++    INPUTSTREAM_LOW_LATENCY_LIVE = (1 << 7),
+   };
+   ///@}
+   //----------------------------------------------------------------------------
+diff --git a/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream/stream_constants.h b/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream/stream_constants.h
+index 8c12c26..3983648 100644
+--- a/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream/stream_constants.h
++++ b/xbmc/addons/kodi-dev-kit/include/kodi/c-api/addon-instance/inputstream/stream_constants.h
+@@ -47,6 +47,15 @@
+ /// stream.
+ #define STREAM_PROPERTY_ISREALTIMESTREAM "isrealtimestream"
+ 
++/// @ingroup cpp_kodi_addon_inputstream_Defs_StreamConstants
++/// @brief How far behind the live edge, in milliseconds, a stream that has
++/// asked to start there would like to be left.
++///
++/// Only meaningful with @ref STREAM_PROPERTY_ISREALTIMESTREAM and a stream
++/// declaring INPUTSTREAM_LOW_LATENCY_LIVE. Smaller is closer to the source
++/// and leaves less room for it to arrive unevenly. Defaults to 100.
++#define STREAM_PROPERTY_LIVE_EDGE_MARGIN "liveedgemargin"
++
+ /// @ingroup cpp_kodi_addon_inputstream_Defs_StreamConstants
+ /// @brief Special value for @ref STREAM_PROPERTY_INPUTSTREAM to use
+ /// ffmpeg to directly play a stream URL.
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.cpp
+index fee72ac..2dfb1bf 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.cpp
+@@ -16,6 +16,8 @@ CDVDInputStream::CDVDInputStream(DVDStreamType streamType, const CFileItem& file
+   m_streamType = streamType;
+   m_contentLookup = true;
+   m_realtime = fileitem.GetProperty(STREAM_PROPERTY_ISREALTIMESTREAM).asBoolean(false);
++  m_liveEdgeMargin = std::chrono::milliseconds(
++      fileitem.GetProperty(STREAM_PROPERTY_LIVE_EDGE_MARGIN).asInteger32(100));
+   m_item = fileitem;
+ }
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h
+index 8f8e8b1..a1603bc 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h
+@@ -15,6 +15,7 @@
+ #include "utils/BitstreamStats.h"
+ #include "utils/Geometry.h"
+ 
++#include <chrono>
+ #include <string>
+ #include <vector>
+ 
+@@ -195,6 +196,21 @@ public:
+ 
+   virtual bool IsRealtime() { return m_realtime; }
+ 
++  /*!
++   * \brief Whether the stream would rather start at its live edge than keep
++   *        the buffer the player's startup delay would otherwise leave in
++   *        front of it. Only consulted for a real time stream.
++   */
++  virtual bool IsLowLatencyLive() { return false; }
++
++  /*!
++   * \brief How far behind the live edge to start such a stream. Smaller is
++   *        closer to the source but leaves less room for it to arrive
++   *        unevenly, which for audio is the difference between playing
++   *        smoothly and being resampled back into place.
++   */
++  std::chrono::milliseconds GetLiveEdgeMargin() const { return m_liveEdgeMargin; }
++
+   void SetRealtime(bool realtime) { m_realtime = realtime; }
+ 
+   // interfaces
+@@ -213,4 +229,5 @@ protected:
+   CFileItem m_item;
+   bool m_contentLookup;
+   bool m_realtime;
++  std::chrono::milliseconds m_liveEdgeMargin{100};
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.cpp
+index daf66ce..aa8d626 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.cpp
+@@ -635,6 +635,11 @@ bool CInputStreamAddon::IsRealtime()
+   return false;
+ }
+ 
++bool CInputStreamAddon::IsLowLatencyLive()
++{
++  return (m_caps.m_mask & INPUTSTREAM_LOW_LATENCY_LIVE) != 0;
++}
++
+ 
+ // IChapter
+ CDVDInputStream::IChapter* CInputStreamAddon::GetIChapter()
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.h b/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.h
+index 7635962..b06dde5 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/InputStreamAddon.h
+@@ -94,6 +94,7 @@ public:
+                           unsigned int maxWidth,
+                           unsigned int maxHeight) override;
+   bool IsRealtime() override;
++  bool IsLowLatencyLive() override;
+ 
+   // IChapter
+   CDVDInputStream::IChapter* GetIChapter() override;
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 78c91a6..55f702f 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -1872,8 +1872,16 @@ CacheInfo CVideoPlayer::GetCachingTimes()
+ void CVideoPlayer::HandlePlaySpeed()
+ {
+   const bool isInMenu = IsInMenuInternal();
+-  const bool tolerateStall =
+-      isInMenu || (m_CurrentVideo.hint.flags & StreamFlags::FLAG_STILL_IMAGES);
++  // A source that has asked to stay at the live edge would rather show a
++  // stale picture for a moment than pause to refill: what it is waiting for
++  // is usually the source having nothing new to send, and the second or two
++  // spent buffering is time a live stream never wins back.
++  const bool lowLatencyLive =
++      m_pInputStream && m_pInputStream->IsRealtime() && m_pInputStream->IsLowLatencyLive();
++
++  const bool tolerateStall = isInMenu ||
++                             (m_CurrentVideo.hint.flags & StreamFlags::FLAG_STILL_IMAGES) ||
++                             lowLatencyLive;
+ 
+   if (tolerateStall && m_caching != CACHESTATE_DONE)
+     SetCaching(CACHESTATE_DONE);
+@@ -2001,6 +2009,15 @@ void CVideoPlayer::HandlePlaySpeed()
+             m_clock.SetSpeedAdjust(adjust);
+           }
+         }
++        else if (m_clock.GetSpeedAdjust() != 0.0)
++        {
++          // Nothing left to pace the clock against, so let it run at its own
++          // speed again. The adjustment above is only ever undone by an audio
++          // queue recovering, and a stream that goes away mid-playback never
++          // gets to do that -- leaving the clock slowed for the rest of the
++          // session, drifting 50ms further behind every second.
++          m_clock.SetSpeedAdjust(0.0);
++        }
+       }
+     }
+   }
+@@ -2049,7 +2066,29 @@ void CVideoPlayer::HandlePlaySpeed()
+         CLog::Log(LOGDEBUG, "VideoPlayer::Sync - Video - pts: {:f}, cache: {:f}, totalcache: {:f}",
+                   m_CurrentVideo.starttime, m_CurrentVideo.cachetime, m_CurrentVideo.cachetotal);
+ 
+-      if (m_CurrentVideo.starttime != DVD_NOPTS_VALUE && m_CurrentVideo.packets > 0 &&
++      // The clock is normally started from the first frame that decoded. On a
++      // live stream that makes however long the stream players took to start
++      // into a presentation latency that lasts the whole session, because such
++      // a stream is produced in real time and so never catches back up. Where
++      // the source has asked to stay close to the live edge, start from the
++      // newest timestamp demuxed instead and let what was queued in front of
++      // it be dropped as late.
++      double liveEdge = DVD_NOPTS_VALUE;
++      if (m_pInputStream->IsRealtime() && m_pInputStream->IsLowLatencyLive())
++      {
++        if (m_CurrentVideo.id >= 0 && m_CurrentVideo.dts != DVD_NOPTS_VALUE)
++          liveEdge = m_CurrentVideo.dts;
++        if (m_CurrentAudio.id >= 0 && m_CurrentAudio.dts != DVD_NOPTS_VALUE)
++          liveEdge = (liveEdge == DVD_NOPTS_VALUE) ? m_CurrentAudio.dts
++                                                   : std::max(liveEdge, m_CurrentAudio.dts);
++      }
++
++      if (liveEdge != DVD_NOPTS_VALUE && m_playSpeed != DVD_PLAYSPEED_PAUSE)
++      {
++        clock = liveEdge - DVD_MSEC_TO_TIME(m_pInputStream->GetLiveEdgeMargin().count());
++        CLog::Log(LOGDEBUG, "VideoPlayer::Sync - starting at live edge: {:f}", clock);
++      }
++      else if (m_CurrentVideo.starttime != DVD_NOPTS_VALUE && m_CurrentVideo.packets > 0 &&
+           m_playSpeed == DVD_PLAYSPEED_PAUSE)
+       {
+         clock = m_CurrentVideo.starttime;
