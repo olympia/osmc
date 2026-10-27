@@ -1,0 +1,25 @@
+From fa0266e24393f2e6b2303153a11e12c4aee76eb9 Mon Sep 17 00:00:00 2001
+From: sarbes <sarbes@kodi.tv>
+Date: Sun, 7 Jul 2024 16:32:33 +0200
+Subject: [PATCH] Fix texture edge clamping (#25444)
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
+xbmc/xbmc#25444 (7572e276). In Omega ClampToEdge() is a member of
+CTexture in xbmc/guilib/Texture.cpp, not of CTextureBase in
+TextureBase.cpp; the change itself is the same one line.
+---
+ xbmc/guilib/Texture.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/xbmc/guilib/Texture.cpp b/xbmc/guilib/Texture.cpp
+index 1b41c0c..c411531 100644
+--- a/xbmc/guilib/Texture.cpp
++++ b/xbmc/guilib/Texture.cpp
+@@ -176,6 +176,7 @@ void CTexture::ClampToEdge()
+       for (unsigned int x = imagePitch; x < texturePitch; x += blockSize)
+         memcpy(dst + x, src, blockSize);
+       dst += texturePitch;
++      src += texturePitch;
+     }
+   }
+ 
