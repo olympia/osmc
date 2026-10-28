@@ -1,0 +1,272 @@
+From feb65e2cd74fbf3e264b2b4e30341a8004a4fc9b Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Sun, 25 Oct 2026 22:28:35 +0100
+Subject: [PATCH] [Video] Fix lost and stale change flags of the information
+ dialog
+
+[Video] Reset the updated items flag of the information dialog (e03d83c)
+
+The flag telling the caller that versions or extras were changed was
+never reset, so after managing them once every later information dialog
+refreshed the whole list, even when nothing changed. It is now reset
+when the dialog opens, and kept when the dialog opens itself again for
+another item or after a cancelled play. Managing versions or extras a
+second time without a change no longer clears it either.
+
+[Video] Do not skip a requested refresh after a user rating change (6807623)
+
+After the information dialog closed, the video window checked for a
+changed user rating before it checked whether Refresh was pressed. A
+rating change followed by Refresh therefore only reloaded the list, and
+the item was never refreshed. The changes made in the dialog are now
+checked after that, and are still reported when the requested refresh
+fails, is cancelled or cannot run.
+
+[Video] Keep the change flags when the information dialog reopens (ef07d4a)
+
+The information dialog opens itself again when it moves on to another
+item, or after a cancelled play. Opening resets the flags telling the
+caller that art or the user rating was changed, so a change made before
+was lost and the list was not refreshed. They are now kept across these
+openings, as the updated items flag already is.
+
+[Video] Save the user rating before the information dialog moves on (ea1593d)
+
+The user rating set in the information dialog was only written to the
+database when the dialog closed, compared with the rating of the item it
+shows by then. Moving on to another movie through the cast or a movie set
+replaces that item first, so the changed rating was never saved, while
+the list already showed it. The rating is now saved before the dialog
+moves on.
+
+[Video] Report art changes of every art type chosen in a row (4b5aa9d)
+
+Choosing art goes through the art types in a loop, and only the result
+of the last type opened was returned. Saving a poster and then backing
+out of the fanart browser reported no change, so the information dialog
+and the Manage menu did not refresh the list for the saved poster. Any
+art saved in the loop is now reported.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
+xbmc/xbmc#30138 (4b5aa9d), its five commits squashed. In Omega
+CVideoInfoTag has no GetMediaType(), so the media type is read from
+m_type and compared to MediaTypeVideoCollection.
+
+Omega's CGUIWindowVideoBase::ShowInfo() returns a bool, true when the
+list has to be updated, and has no ShowInfoResult. Where upstream
+returns RESULT_ERROR it now returns whether the dialog made changes,
+which also covers Omega's return when there is no scraper. A rating
+change no longer returns early, as upstream.
+
+Omega's CArtTypeChooser has no UpdateArtType(), so in
+ChooseAndManageVideoItemArtwork() only the result is fixed.
+---
+ xbmc/video/dialogs/GUIDialogVideoInfo.cpp | 60 +++++++++++++++++------
+ xbmc/video/dialogs/GUIDialogVideoInfo.h   |  1 +
+ xbmc/video/windows/GUIWindowVideoBase.cpp | 16 +++---
+ 3 files changed, 56 insertions(+), 21 deletions(-)
+
+diff --git a/xbmc/video/dialogs/GUIDialogVideoInfo.cpp b/xbmc/video/dialogs/GUIDialogVideoInfo.cpp
+index 04c27d1b3..96bdf5b8e 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoInfo.cpp
++++ b/xbmc/video/dialogs/GUIDialogVideoInfo.cpp
+@@ -113,17 +113,7 @@ bool CGUIDialogVideoInfo::OnMessage(CGUIMessage& message)
+   case GUI_MSG_WINDOW_DEINIT:
+     {
+       ClearCastList();
+-
+-      if (m_startUserrating != m_movieItem->GetVideoInfoTag()->m_iUserRating)
+-      {
+-        CVideoDatabase db;
+-        if (db.Open())
+-        {
+-          m_hasUpdatedUserrating = true;
+-          db.SetVideoUserRating(m_movieItem->GetVideoInfoTag()->m_iDbId, m_movieItem->GetVideoInfoTag()->m_iUserRating, m_movieItem->GetVideoInfoTag()->m_type);
+-          db.Close();
+-        }
+-      }
++      SaveUserrating();
+     }
+     break;
+ 
+@@ -162,11 +152,13 @@ bool CGUIDialogVideoInfo::OnMessage(CGUIMessage& message)
+       }
+       else if (iControl == CONTROL_BTN_MANAGE_VIDEO_VERSIONS)
+       {
+-        m_hasUpdatedItems = OnManageVideoVersions();
++        if (OnManageVideoVersions())
++          m_hasUpdatedItems = true;
+       }
+       else if (iControl == CONTROL_BTN_MANAGE_VIDEO_EXTRAS)
+       {
+-        m_hasUpdatedItems = OnManageVideoExtras();
++        if (OnManageVideoExtras())
++          m_hasUpdatedItems = true;
+       }
+       else if (iControl == CONTROL_BTN_PLAY)
+       {
+@@ -230,9 +222,16 @@ bool CGUIDialogVideoInfo::OnMessage(CGUIMessage& message)
+           std::string strItem = m_castList->Get(iItem)->GetLabel();
+           if (m_movieItem->GetVideoInfoTag()->m_type == MediaTypeVideoCollection)
+           {
++            SaveUserrating();
+             SetMovie(m_castList->Get(iItem).get());
++            const bool hasUpdatedThumb{m_hasUpdatedThumb};
++            const bool hasUpdatedUserrating{m_hasUpdatedUserrating};
++            const bool hasUpdatedItems{m_hasUpdatedItems};
+             Close();
+             Open();
++            m_hasUpdatedThumb = m_hasUpdatedThumb || hasUpdatedThumb;
++            m_hasUpdatedUserrating = m_hasUpdatedUserrating || hasUpdatedUserrating;
++            m_hasUpdatedItems = m_hasUpdatedItems || hasUpdatedItems;
+           }
+           else
+             OnSearch(strItem);
+@@ -265,6 +264,7 @@ void CGUIDialogVideoInfo::OnInitWindow()
+   m_bRefreshAll = true;
+   m_hasUpdatedThumb = false;
+   m_hasUpdatedUserrating = false;
++  m_hasUpdatedItems = false;
+   m_bViewReview = true;
+ 
+   const std::shared_ptr<CProfileManager> profileManager = CServiceBroker::GetSettingsComponent()->GetProfileManager();
+@@ -340,6 +340,23 @@ void CGUIDialogVideoInfo::SetUserrating(int userrating) const
+   }
+ }
+ 
++void CGUIDialogVideoInfo::SaveUserrating()
++{
++  if (m_startUserrating == m_movieItem->GetVideoInfoTag()->m_iUserRating)
++    return;
++
++  CVideoDatabase db;
++  if (db.Open())
++  {
++    m_hasUpdatedUserrating = true;
++    db.SetVideoUserRating(m_movieItem->GetVideoInfoTag()->m_iDbId,
++                          m_movieItem->GetVideoInfoTag()->m_iUserRating,
++                          m_movieItem->GetVideoInfoTag()->m_type);
++    db.Close();
++    m_startUserrating = m_movieItem->GetVideoInfoTag()->m_iUserRating;
++  }
++}
++
+ void CGUIDialogVideoInfo::SetMovie(const CFileItem *item)
+ {
+   *m_movieItem = *item;
+@@ -680,6 +697,8 @@ void CGUIDialogVideoInfo::DoSearch(std::string& strSearch, CFileItemList& items)
+ 
+ void CGUIDialogVideoInfo::OnSearchItemFound(const CFileItem* pItem)
+ {
++  SaveUserrating();
++
+   VideoDbContentType type = pItem->GetVideoContentType();
+ 
+   CVideoDatabase db;
+@@ -716,8 +735,14 @@ void CGUIDialogVideoInfo::OnSearchItemFound(const CFileItem* pItem)
+   *item.GetVideoInfoTag() = movieDetails;
+   SetMovie(&item);
+   // refresh our window entirely
++  const bool hasUpdatedThumb{m_hasUpdatedThumb};
++  const bool hasUpdatedUserrating{m_hasUpdatedUserrating};
++  const bool hasUpdatedItems{m_hasUpdatedItems};
+   Close();
+   Open();
++  m_hasUpdatedThumb = m_hasUpdatedThumb || hasUpdatedThumb;
++  m_hasUpdatedUserrating = m_hasUpdatedUserrating || hasUpdatedUserrating;
++  m_hasUpdatedItems = m_hasUpdatedItems || hasUpdatedItems;
+ }
+ 
+ void CGUIDialogVideoInfo::ClearCastList()
+@@ -838,7 +863,13 @@ void CGUIDialogVideoInfo::Play(bool resume)
+       {
+         // The Resume dialog was closed without any choice
+         SetMovie(m_movieItem.get()); // restore cast list, which was cleared on dialog close
++        const bool hasUpdatedThumb{m_hasUpdatedThumb};
++        const bool hasUpdatedUserrating{m_hasUpdatedUserrating};
++        const bool hasUpdatedItems{m_hasUpdatedItems};
+         Open();
++        m_hasUpdatedThumb = m_hasUpdatedThumb || hasUpdatedThumb;
++        m_hasUpdatedUserrating = m_hasUpdatedUserrating || hasUpdatedUserrating;
++        m_hasUpdatedItems = m_hasUpdatedItems || hasUpdatedItems;
+       }
+     }
+   }
+@@ -1826,7 +1857,8 @@ bool CGUIDialogVideoInfo::ChooseAndManageVideoItemArtwork(const std::shared_ptr<
+     if (!chooser.ChooseArtType())
+       break;
+ 
+-    result = ManageVideoItemArtwork(item, item->GetVideoInfoTag()->m_type, chooser.GetArtType());
++    if (ManageVideoItemArtwork(item, item->GetVideoInfoTag()->m_type, chooser.GetArtType()))
++      result = true;
+ 
+   } while (true);
+ 
+diff --git a/xbmc/video/dialogs/GUIDialogVideoInfo.h b/xbmc/video/dialogs/GUIDialogVideoInfo.h
+index 8d3f8dacb..5d3de0189 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoInfo.h
++++ b/xbmc/video/dialogs/GUIDialogVideoInfo.h
+@@ -97,6 +97,7 @@ protected:
+   void OnGetArt();
+   void OnGetFanart();
+   void OnSetUserrating() const;
++  void SaveUserrating();
+   void PlayTrailer();
+ 
+   static bool UpdateVideoItemSortTitle(const std::shared_ptr<CFileItem>& pItem);
+diff --git a/xbmc/video/windows/GUIWindowVideoBase.cpp b/xbmc/video/windows/GUIWindowVideoBase.cpp
+index 3e4ac6c56..dc8f6ef4c 100644
+--- a/xbmc/video/windows/GUIWindowVideoBase.cpp
++++ b/xbmc/video/windows/GUIWindowVideoBase.cpp
+@@ -420,6 +420,8 @@ bool CGUIWindowVideoBase::ShowInfo(const CFileItemPtr& item2, const ScraperPtr&
+   }
+ 
+   bool needsRefresh = false;
++  // changes made in the dialog before a refresh, which may fail or not run at all
++  bool hasChanges = false;
+   if (bHasInfo)
+   {
+     // @todo add support to refresh movie version information
+@@ -429,11 +431,11 @@ bool CGUIWindowVideoBase::ShowInfo(const CFileItemPtr& item2, const ScraperPtr&
+     *item->GetVideoInfoTag() = movieDetails;
+     pDlgInfo->SetMovie(item.get());
+     pDlgInfo->Open();
+-    if (pDlgInfo->HasUpdatedUserrating())
+-      return true;
++    hasChanges = pDlgInfo->HasUpdatedUserrating() || pDlgInfo->HasUpdatedThumb() ||
++                 pDlgInfo->HasUpdatedItems();
+     needsRefresh = pDlgInfo->NeedRefresh();
+     if (!needsRefresh)
+-      return (pDlgInfo->HasUpdatedThumb() || pDlgInfo->HasUpdatedItems());
++      return hasChanges;
+     // check if the item in the video info dialog has changed and if so, get the new item
+     else if (pDlgInfo->GetCurrentListItem() != NULL)
+     {
+@@ -458,15 +460,15 @@ bool CGUIWindowVideoBase::ShowInfo(const CFileItemPtr& item2, const ScraperPtr&
+ 
+   // quietly return if Internet lookups are disabled
+   if (!profileManager->GetCurrentProfile().canWriteDatabases() && !g_passwordManager.bMasterUser)
+-    return false;
++    return hasChanges;
+ 
+   if (!info)
+-    return false;
++    return hasChanges;
+ 
+   if (CVideoLibraryQueue::GetInstance().IsScanningLibrary())
+   {
+     HELPERS::ShowOKDialogText(CVariant{13346}, CVariant{14057});
+-    return false;
++    return hasChanges;
+   }
+ 
+   bool listNeedsUpdating = false;
+@@ -500,7 +502,7 @@ bool CGUIWindowVideoBase::ShowInfo(const CFileItemPtr& item2, const ScraperPtr&
+     listNeedsUpdating = true;
+   } while (needsRefresh);
+ 
+-  return listNeedsUpdating;
++  return listNeedsUpdating || hasChanges;
+ }
+ 
+ bool CGUIWindowVideoBase::ShowInfoAndRefresh(const CFileItemPtr& item, const ScraperPtr& info)
