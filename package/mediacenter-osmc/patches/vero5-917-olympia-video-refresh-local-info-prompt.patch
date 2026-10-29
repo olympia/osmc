@@ -1,0 +1,190 @@
+From b74d5bb433f609e1206ec0e2e9dc97ea9de17b73 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Tue, 27 Oct 2026 22:12:01 +0100
+Subject: [PATCH] [Video] Skip the local information question if the answer has
+ no effect
+
+Refreshing an item from the information dialog asked whether to ignore
+the locally stored information and refresh from the internet, also when
+there was nothing local at all. The check for a usable NFO became
+"anything but an NFO error" in 28494c07d3, which let the no NFO case
+through as well.
+
+For movies and music videos the question now comes when the NFO or the
+embedded tags can be used or when there is item or folder art next to
+the file, the set art next to a movie included, as the scanner reads
+those only with local information. The check follows the scanner,
+within the artwork level setting, and lists the folder of the file
+before the question, which the scan does again when it uses local
+information. Actor thumbs in .actors and the art in the movie set
+information folder are used whatever the answer is, so they do not
+count.
+
+TV shows, seasons and episodes are still asked without an NFO, because
+there the answer can also cover the episode NFOs and the season art.
+The same goes for an item listed as a folder in the file view, and for
+a movie or music video in the folder that has its own content setting,
+scanned recursively with folder names, where the NFO lookup of the job
+differs from the scan and can miss the NFO the scan uses.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
+xbmc/xbmc#30169 (e27613b). Omega names are used: CONTENT_* for the
+content types, CInfoScanner::NO_NFO and ERROR_NFO, MediaTypeMovie,
+MediaTypeMusicVideo and MediaTypeVideoCollection. Omega has no hybrid
+folders, so m_bIsFolder of the item stands for
+VIDEO::IsBrowsableFolder(). The condition in Omega has no exception for
+the metadata.local scraper, which comes from another change, and none is
+added.
+
+Omega looks for the local art inside CVideoInfoScanner::GetArtwork():
+with folder names it also checks the folder of the file, then the local
+art base filename, both with CVideoInfoScanner::AddLocalItemArtwork(),
+which is made public for this. HasLocalArt() follows that. Unlike the
+second paragraph says, in Omega the scanner reads the art in the movie
+set information folder only with local information too, so for a movie
+that is not a plugin item it counts as well, looked up for the set the
+movie is in now.
+---
+ xbmc/video/VideoInfoScanner.h                 |  8 +-
+ xbmc/video/jobs/VideoLibraryRefreshingJob.cpp | 78 ++++++++++++++++++-
+ 2 files changed, 79 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/video/VideoInfoScanner.h b/xbmc/video/VideoInfoScanner.h
+index 85e78ca60a..4bc0957f2d 100644
+--- a/xbmc/video/VideoInfoScanner.h
++++ b/xbmc/video/VideoInfoScanner.h
+@@ -105,6 +105,10 @@ namespace VIDEO
+ 
+     static std::string GetMovieSetInfoFolder(const std::string& setTitle);
+ 
++    static void AddLocalItemArtwork(CGUIListItem::ArtMap& itemArt,
++      const std::vector<std::string>& wantedArtTypes, const std::string& itemPath,
++      bool addAll, bool exactName);
++
+   protected:
+     virtual void Process();
+     bool DoScan(const std::string& strDirectory) override;
+@@ -252,10 +256,6 @@ namespace VIDEO
+     std::set<int> m_pathsToClean;
+ 
+   private:
+-    static void AddLocalItemArtwork(CGUIListItem::ArtMap& itemArt,
+-      const std::vector<std::string>& wantedArtTypes, const std::string& itemPath,
+-      bool addAll, bool exactName);
+-
+     /*! \brief Retrieve the art type for an image from the given size.
+      \param width the width of the image.
+      \param height the height of the image.
+diff --git a/xbmc/video/jobs/VideoLibraryRefreshingJob.cpp b/xbmc/video/jobs/VideoLibraryRefreshingJob.cpp
+index 202b6c3899..c660aa2afe 100644
+--- a/xbmc/video/jobs/VideoLibraryRefreshingJob.cpp
++++ b/xbmc/video/jobs/VideoLibraryRefreshingJob.cpp
+@@ -24,6 +24,7 @@
+ #include "media/MediaType.h"
+ #include "messaging/helpers/DialogOKHelper.h"
+ #include "settings/AdvancedSettings.h"
++#include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "utils/StringUtils.h"
+ #include "utils/URIUtils.h"
+@@ -31,16 +32,78 @@
+ #include "video/VideoDatabase.h"
+ #include "video/VideoInfoDownloader.h"
+ #include "video/VideoInfoScanner.h"
++#include "video/VideoThumbLoader.h"
+ #include "video/tags/IVideoInfoTagLoader.h"
+ #include "video/tags/VideoInfoTagLoaderFactory.h"
+ #include "video/tags/VideoTagLoaderPlugin.h"
+ 
+ #include <memory>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ using namespace KODI::MESSAGING;
+ using namespace VIDEO;
+ 
++namespace
++{
++// Whether there is art next to a movie or music video, or in the movie set information folder of
++// the set of a movie, that the scanner picks up only when it may use local information, following
++// CVideoInfoScanner::GetArtwork. It lists the folders and can cache a folder image to tell its
++// type, the same work the scan does again when it uses local information.
++bool HasLocalArt(const CFileItem& item, CONTENT_TYPE content, bool useFolderNames)
++{
++  if (content != CONTENT_MOVIES && content != CONTENT_MUSICVIDEOS)
++    return false;
++
++  const int artLevel{CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++      CSettings::SETTING_VIDEOLIBRARY_ARTWORK_LEVEL)};
++  if (artLevel == CSettings::VIDEOLIBRARY_ARTWORK_LEVEL_NONE)
++    return false;
++
++  const bool addAll{artLevel == CSettings::VIDEOLIBRARY_ARTWORK_LEVEL_ALL};
++  const bool exactName{artLevel == CSettings::VIDEOLIBRARY_ARTWORK_LEVEL_BASIC};
++  std::vector<std::string> artTypes{CVideoThumbLoader::GetArtTypes(
++      content == CONTENT_MOVIES ? MediaTypeMovie : MediaTypeMusicVideo)};
++
++  // the art of the set of a movie is taken from next to the movie as well. The set comes from the
++  // new scrape, so the names are looked for whether or not the movie is in a set now
++  std::vector<std::string> setArtTypes;
++  if (content == CONTENT_MOVIES)
++  {
++    setArtTypes = CVideoThumbLoader::GetArtTypes(MediaTypeVideoCollection);
++    for (const std::string& artType : setArtTypes)
++      artTypes.push_back("set." + artType);
++  }
++
++  CGUIListItem::ArtMap art;
++  if (!item.SkipLocalArt())
++  {
++    const std::string filename{item.GetLocalArtBaseFilename()};
++    if (useFolderNames)
++    {
++      const std::string directory{URIUtils::GetDirectory(filename)};
++      if (filename != directory)
++        CVideoInfoScanner::AddLocalItemArtwork(art, artTypes, directory, addAll, exactName);
++    }
++    CVideoInfoScanner::AddLocalItemArtwork(art, artTypes, filename, addAll, exactName);
++  }
++
++  // the scanner reads the movie set information folder only with local information as well, which
++  // it never uses for a plugin. The set the movie is in now is taken, which the new scrape
++  // normally keeps
++  if (art.empty() && content == CONTENT_MOVIES && !item.IsPlugin() && item.HasVideoInfoTag())
++  {
++    const std::string setInfoPath{
++        CVideoInfoScanner::GetMovieSetInfoFolder(item.GetVideoInfoTag()->m_set.title)};
++    if (!setInfoPath.empty())
++      CVideoInfoScanner::AddLocalItemArtwork(art, setArtTypes, setInfoPath, addAll, exactName);
++  }
++
++  return !art.empty();
++}
++} // unnamed namespace
++
+ CVideoLibraryRefreshingJob::CVideoLibraryRefreshingJob(std::shared_ptr<CFileItem> item,
+                                                        bool forceRefresh,
+                                                        bool refreshAll,
+@@ -148,9 +211,18 @@ bool CVideoLibraryRefreshingJob::Work(CVideoDatabase &db)
+       else if (nfoResult != CInfoScanner::NO_NFO)
+         hasDetails = true;
+ 
+-      // if we are performing a forced refresh ask the user to choose between using a valid NFO and a valid scraper
+-      if (needsRefresh && IsModal() && !scraper->IsNoop()
+-          && nfoResult != CInfoScanner::ERROR_NFO)
++      // if we are performing a forced refresh ask the user to choose between using the local
++      // information and a valid scraper. A broken nfo is ignored anyway, which leaves the local
++      // art unused as well. Without an nfo the answer can still matter: for tv shows it can decide
++      // about the episode nfos and the episode and season art, the nfo lookup above can miss the
++      // nfo of an item listed as a folder in the file view, and it uses other folder name settings
++      // than the scan for a movie or music video in the folder that has its own content setting,
++      // scanned recursively with folder names. For the other movies and music videos only local
++      // art next to the file or in the movie set information folder makes a difference.
++      if (needsRefresh && IsModal() && !scraper->IsNoop() && nfoResult != CInfoScanner::ERROR_NFO &&
++          (nfoResult != CInfoScanner::NO_NFO || scraper->Content() == CONTENT_TVSHOWS ||
++           m_item->m_bIsFolder || scanSettings.parent_name != scanSettings.parent_name_root ||
++           HasLocalArt(*m_item, scraper->Content(), scanSettings.parent_name)))
+       {
+         int heading = 20159;
+         if (scraper->Content() == CONTENT_MOVIES)
