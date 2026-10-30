@@ -1,0 +1,386 @@
+Subject: [PATCH] [vero5] Opt-in poster CPU/upload edge diagnostics
+
+Diagnostic-only instrumentation for Kodi 21.3 a3a448d plus the current
+all/arm/vero5 patch series (including edge clamp fix 912).
+An exact local image path in special://temp/texture-edge-diagnostics.conf
+enables three raw snapshots per load and bounded draw/upload metadata.
+No texture contents, scaling or sampling parameters are changed.
+Raw captures are limited to 20 loads and 128 MiB per process session.
+No output is produced without the config file. See tools/texture-edge-diagnostics.
+
+diff --git a/xbmc/guilib/Texture.h b/xbmc/guilib/Texture.h
+--- a/xbmc/guilib/Texture.h
++++ b/xbmc/guilib/Texture.h
+@@ -11,6 +11,7 @@
+ #include "guilib/TextureFormats.h"
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <memory>
+ #include <string>
+ 
+@@ -101,6 +102,8 @@
+   virtual void LoadToGPU() = 0;
+   virtual void BindToUnit(unsigned int unit) = 0;
+ 
++  uint64_t GetDiagnosticId() const { return m_diagnosticId; }
++
+   unsigned char* GetPixels() const { return m_pixels; }
+   unsigned int GetPitch() const { return GetPitch(m_textureWidth); }
+   unsigned int GetRows() const { return GetRows(m_textureHeight); }
+@@ -157,4 +160,5 @@
+   bool m_mipmapping =  false ;
+   TEXTURE_SCALING m_scalingMethod = TEXTURE_SCALING::LINEAR;
+   bool m_bCacheMemory = false;
++  uint64_t m_diagnosticId{0};
+ };
+diff --git a/xbmc/guilib/Texture.cpp b/xbmc/guilib/Texture.cpp
+--- a/xbmc/guilib/Texture.cpp
++++ b/xbmc/guilib/Texture.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "Texture.h"
++#include "TextureEdgeDiagnostics.h"
+ 
+ #include "DDSImage.h"
+ #include "ServiceBroker.h"
+@@ -243,6 +244,7 @@
+                                     bool requirePixels,
+                                     const std::string& strMimeType)
+ {
++  m_diagnosticId = TextureEdgeDiagnostics::Begin(texturePath);
+   if (URIUtils::HasExtension(texturePath, ".dds"))
+   { // special case for DDS images
+     CDDSImage image;
+@@ -372,7 +374,9 @@
+         m_originalHeight = pImage->originalHeight();
+         m_imageWidth = pImage->Width();
+         m_imageHeight = pImage->Height();
++        TextureEdgeDiagnostics::Dump(m_diagnosticId, *this, "decoded", "BGRA");
+         ClampToEdge();
++        TextureEdgeDiagnostics::Dump(m_diagnosticId, *this, "clamped", "BGRA");
+         return true;
+       }
+     }
+diff --git a/xbmc/guilib/TextureGL.cpp b/xbmc/guilib/TextureGL.cpp
+--- a/xbmc/guilib/TextureGL.cpp
++++ b/xbmc/guilib/TextureGL.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "TextureGL.h"
++#include "TextureEdgeDiagnostics.h"
+ 
+ #include "ServiceBroker.h"
+ #include "guilib/TextureManager.h"
+@@ -17,6 +18,7 @@
+ #include "utils/log.h"
+ 
+ #include <memory>
++#include <sstream>
+ 
+ std::unique_ptr<CTexture> CTexture::CreateTexture(unsigned int width,
+                                                   unsigned int height,
+@@ -198,6 +200,25 @@
+       }
+       break;
+   }
++  if (m_diagnosticId && m_format == XB_FMT_A8R8G8B8)
++  {
++    // Capture AFTER the possible BGRA -> RGBA swap, immediately before upload.
++    TextureEdgeDiagnostics::Dump(m_diagnosticId, *this, "upload",
++                                 pixelformat == GL_RGBA ? "RGBA" : "BGRA");
++    GLint unpackAlignment = 0;
++    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpackAlignment);
++    std::ostringstream info;
++    GLint minFilter = 0, magFilter = 0, wrapS = 0, wrapT = 0;
++    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minFilter);
++    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magFilter);
++    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &wrapS);
++    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wrapT);
++    info << "upload gl_texture=" << m_texture << " internalformat=" << internalformat
++         << " pixelformat=" << pixelformat << " unpack_alignment=" << unpackAlignment
++         << " min_filter=" << minFilter << " mag_filter=" << magFilter
++         << " mipmapped=" << IsMipmapped() << " wrap_s=" << wrapS << " wrap_t=" << wrapT;
++    TextureEdgeDiagnostics::Event(m_diagnosticId, info.str());
++  }
+   glTexImage2D(GL_TEXTURE_2D, 0, internalformat, m_textureWidth, m_textureHeight, 0,
+     pixelformat, GL_UNSIGNED_BYTE, m_pixels);
+ 
+diff --git a/xbmc/guilib/GUITextureGLES.cpp b/xbmc/guilib/GUITextureGLES.cpp
+--- a/xbmc/guilib/GUITextureGLES.cpp
++++ b/xbmc/guilib/GUITextureGLES.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "ServiceBroker.h"
+ #include "Texture.h"
++#include "TextureEdgeDiagnostics.h"
+ #include "rendering/gles/RenderSystemGLES.h"
+ #include "utils/GLUtils.h"
+ #include "utils/MathUtils.h"
+@@ -18,6 +19,7 @@
+ #include "windowing/WinSystem.h"
+ 
+ #include <cstddef>
++#include <sstream>
+ 
+ void CGUITextureGLES::Register()
+ {
+@@ -130,6 +132,22 @@
+     glVertexAttribPointer(tex0Loc, 2, GL_FLOAT, 0, sizeof(PackedVertex), (char*)&m_packedVertices[0] + offsetof(PackedVertex, u1));
+     glEnableVertexAttribArray(tex0Loc);
+ 
++    const auto diagnosticId = m_texture.m_textures[m_currentFrame]->GetDiagnosticId();
++    if (diagnosticId)
++    {
++      std::ostringstream info;
++      info << "draw control=" << reinterpret_cast<uintptr_t>(this)
++           << " diffuse=" << m_diffuse.size() << " color=" << unsigned(m_col[0]) << ','
++           << unsigned(m_col[1]) << ',' << unsigned(m_col[2]) << ',' << unsigned(m_col[3])
++           << " vertices=" << m_packedVertices.size();
++      // Bound each record even if an unexpected control generates many quads.
++      for (size_t i = 0; i < m_packedVertices.size() && i < 36; ++i)
++      {
++        const auto& v = m_packedVertices[i];
++        info << " v" << i << '=' << v.x << ',' << v.y << ',' << v.z << ',' << v.u1 << ',' << v.v1;
++      }
++      TextureEdgeDiagnostics::Event(diagnosticId, info.str(), reinterpret_cast<uintptr_t>(this));
++    }
+     glDrawElements(GL_TRIANGLES, m_packedVertices.size()*6 / 4, GL_UNSIGNED_SHORT, m_idx.data());
+ 
+     if (m_diffuse.size())
+diff --git a/xbmc/guilib/CMakeLists.txt b/xbmc/guilib/CMakeLists.txt
+--- a/xbmc/guilib/CMakeLists.txt
++++ b/xbmc/guilib/CMakeLists.txt
+@@ -1,4 +1,5 @@
+-set(SOURCES DDSImage.cpp
++set(SOURCES TextureEdgeDiagnostics.cpp
++            DDSImage.cpp
+             DirtyRegionSolvers.cpp
+             DirtyRegionTracker.cpp
+             FFmpegImage.cpp
+diff --git a/xbmc/guilib/TextureEdgeDiagnostics.cpp b/xbmc/guilib/TextureEdgeDiagnostics.cpp
+--- /dev/null
++++ b/xbmc/guilib/TextureEdgeDiagnostics.cpp
+@@ -0,0 +1,201 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "TextureEdgeDiagnostics.h"
++
++#include "Texture.h"
++#include "filesystem/SpecialProtocol.h"
++#include "utils/log.h"
++
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace
++{
++constexpr uint64_t MAX_BYTES = 128ULL * 1024 * 1024;
++constexpr uint64_t MAX_LOADS = 20;
++constexpr unsigned int MAX_EVENTS = 2000;
++
++int64_t Now()
++{
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
++struct State
++{
++  State()
++  {
++    const std::string temp = CSpecialProtocol::TranslatePath("special://temp/");
++    std::ifstream config(temp + "texture-edge-diagnostics.conf");
++    if (!std::getline(config, target))
++      return;
++    if (!target.empty() && target.back() == '\r')
++      target.pop_back();
++    // Exact local pathname only; never match every image or remote credentials.
++    if (target.empty() || target.front() != '/')
++    {
++      target.clear();
++      return;
++    }
++    std::string pattern = temp + "texture-edge-diag-XXXXXX";
++    std::vector<char> name(pattern.begin(), pattern.end());
++    name.push_back('\0');
++    const char* created = ::mkdtemp(name.data());
++    if (!created)
++    {
++      target.clear();
++      CLog::Log(LOGWARNING, "TextureEdgeDiag v1: cannot create output directory");
++      return;
++    }
++    directory = created;
++    events.open(directory + "/events.tsv", std::ios::out);
++    std::ofstream source(directory + "/source.txt");
++    source << target << '\n';
++    if (!events || !source)
++    {
++      target.clear();
++      CLog::Log(LOGWARNING, "TextureEdgeDiag v1: cannot open output files");
++      return;
++    }
++    events << "epoch_ms\tid\tevent\n";
++    CLog::Log(LOGINFO, "TextureEdgeDiag v1: enabled; output {}", directory);
++  }
++
++  std::mutex mutex;
++  std::string target;
++  std::string directory;
++  std::ofstream events;
++  uint64_t loads{0};
++  uint64_t bytes{0};
++  unsigned int count{0};
++  std::map<std::pair<uint64_t, uintptr_t>, std::chrono::steady_clock::time_point> lastDraw;
++  bool trackerLimitReported{false};
++  std::array<unsigned int, MAX_LOADS + 1> dumps{};
++
++  void Log(uint64_t id, const std::string& text)
++  {
++    if (count < MAX_EVENTS)
++    {
++      ++count;
++      events << Now() << '\t' << id << '\t' << text << std::endl;
++    }
++    else if (count == MAX_EVENTS)
++    {
++      ++count;
++      events << Now() << "\t0\tevent_limit_reached further_events_omitted" << std::endl;
++    }
++  }
++};
++
++State& GetState()
++{
++  static State state;
++  return state;
++}
++}
++
++uint64_t TextureEdgeDiagnostics::Begin(const std::string& path)
++{
++  auto& state = GetState();
++  if (state.target.empty() || CSpecialProtocol::TranslatePath(path) != state.target)
++    return 0;
++  std::lock_guard<std::mutex> lock(state.mutex);
++  if (state.loads >= MAX_LOADS)
++    return 0;
++  const uint64_t id = ++state.loads;
++  state.Log(id, "begin");
++  CLog::Log(LOGINFO, "TextureEdgeDiag v1: load {}", id);
++  return id;
++}
++
++void TextureEdgeDiagnostics::Event(uint64_t id, const std::string& text, uintptr_t control)
++{
++  if (!id || id > MAX_LOADS)
++    return;
++  auto& state = GetState();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  if (state.count >= MAX_EVENTS)
++  {
++    state.Log(id, text); // Emit the one-time truncation marker, if needed.
++    return;
++  }
++  if (control)
++  {
++    const auto key = std::make_pair(id, control);
++    auto previous = state.lastDraw.find(key);
++    // Bound bookkeeping too, even if a skin repeatedly creates new controls.
++    if (previous == state.lastDraw.end() && state.lastDraw.size() >= 128)
++    {
++      if (!state.trackerLimitReported)
++      {
++        state.trackerLimitReported = true;
++        state.Log(id, "draw_tracker_limit_reached new_controls_omitted");
++      }
++      return;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (previous != state.lastDraw.end() &&
++        now - previous->second < std::chrono::milliseconds(250))
++      return;
++    state.lastDraw[key] = now;
++  }
++  state.Log(id, text);
++}
++
++void TextureEdgeDiagnostics::Dump(uint64_t id, const CTexture& t,
++                                  const char* stage, const char* encoding)
++{
++  if (!id || id > MAX_LOADS)
++    return;
++  auto& state = GetState();
++  std::lock_guard<std::mutex> lock(state.mutex);
++  // This diagnostic supports ordinary 32-bit poster images only.
++  const uint64_t size = uint64_t(t.GetPitch()) * t.GetRows();
++  if (!t.GetPixels() || !t.GetWidth() || !t.GetHeight() ||
++      t.GetWidth() > t.GetTextureWidth() || t.GetHeight() > t.GetTextureHeight() ||
++      uint64_t(t.GetPitch()) != uint64_t(t.GetTextureWidth()) * 4 ||
++      t.GetRows() != t.GetTextureHeight() || size > MAX_BYTES ||
++      state.bytes > MAX_BYTES - size || state.dumps[id] >= 3)
++  {
++    state.Log(id, std::string("dump_skipped ") + stage + " invalid_dimensions_or_budget");
++    return;
++  }
++  state.bytes += size; // Reserve even if I/O fails; never exceed the session budget.
++  ++state.dumps[id];
++  const std::string stem = state.directory + "/" + std::to_string(id) + "-" + stage;
++  std::ofstream raw(stem + ".raw", std::ios::binary);
++  raw.write(reinterpret_cast<const char*>(t.GetPixels()), static_cast<std::streamsize>(size));
++  raw.close();
++  // Check padding without modifying it. Before clamping, mismatches are expected.
++  uint64_t rightBad = 0;
++  uint64_t bottomBad = 0;
++  const auto* pixels = t.GetPixels();
++  for (unsigned int y = 0; y < t.GetHeight(); ++y)
++  {
++    const auto* row = pixels + size_t(y) * t.GetPitch();
++    for (unsigned int x = t.GetWidth(); x < t.GetTextureWidth(); ++x)
++      rightBad += std::memcmp(row + size_t(x) * 4, row + size_t(t.GetWidth() - 1) * 4, 4) != 0;
++  }
++  for (unsigned int y = t.GetHeight(); y < t.GetTextureHeight(); ++y)
++    bottomBad += std::memcmp(pixels + size_t(y) * t.GetPitch(),
++                            pixels + size_t(t.GetHeight() - 1) * t.GetPitch(), t.GetPitch()) != 0;
++  std::ofstream meta(stem + ".meta");
++  meta << "version=1\nid=" << id << "\nstage=" << stage << "\nepoch_ms=" << Now()
++       << "\nencoding=" << encoding << "\nwidth=" << t.GetWidth()
++       << "\nheight=" << t.GetHeight() << "\ntexture_width=" << t.GetTextureWidth()
++       << "\ntexture_height=" << t.GetTextureHeight() << "\npitch=" << t.GetPitch()
++       << "\nrows=" << t.GetRows() << "\nbytes=" << size
++       << "\noriginal_width=" << t.GetOriginalWidth()
++       << "\noriginal_height=" << t.GetOriginalHeight()
++       << "\norientation=" << t.GetOrientation() << "\nalpha=" << t.HasAlpha()
++       << "\nright_bad_pixels=" << rightBad << "\nbottom_bad_rows=" << bottomBad << '\n';
++  meta.close();
++  state.Log(id, std::string(raw && meta ? "dump " : "dump_io_error ") + stage);
++}
+diff --git a/xbmc/guilib/TextureEdgeDiagnostics.h b/xbmc/guilib/TextureEdgeDiagnostics.h
+--- /dev/null
++++ b/xbmc/guilib/TextureEdgeDiagnostics.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++class CTexture;
++
++namespace TextureEdgeDiagnostics
++{
++// Configuration is read once, on first file load. No configuration means no output.
++uint64_t Begin(const std::string& path);
++void Dump(uint64_t id, const CTexture& texture, const char* stage, const char* encoding);
++void Event(uint64_t id, const std::string& text, uintptr_t control = 0);
++}
