@@ -1,0 +1,49 @@
+Subject: [PATCH] [vero5] Test bypass for odd-width unscaled YUV image conversion
+
+Target Kodi 21.3 a3a448d plus the all/arm/vero5 series through 919.
+The Moonraker 379x540 cache JPEG yielded different BGRA bytes only in
+column 378 across otherwise identical loads, before ClampToEdge and GPU
+upload. FFmpeg 6.0.1's generic unscaled yuv2rgb_c_32 handles 8/4/2 pixel
+blocks, leaving an odd final column unwritten. Its selection requires
+even height but does not exclude odd width. The ARM NEON unscaled path
+requires width divisible by 16 and therefore cannot handle this case.
+
+For the matching odd-width/even-height unscaled YUV420P/YUV422P/YUVA420P
+image conversions, request SWS_ACCURATE_RND to exclude the generic fast
+path. ConvertFormats already maps YUVJ420P/422P to these formats. Keep
+the image dimensions, existing range handling and diagnostic snapshots.
+Other image conversions retain SWS_BICUBIC. This is a targeted test
+workaround, not a backport of an upstream FFmpeg fix; on-device validation
+is required. Accurate rounding may change RGB values versus the fast path.
+
+diff --git a/xbmc/guilib/FFmpegImage.cpp b/xbmc/guilib/FFmpegImage.cpp
+--- a/xbmc/guilib/FFmpegImage.cpp
++++ b/xbmc/guilib/FFmpegImage.cpp
+@@ -505,8 +505,26 @@
+   nWidth = std::max(nWidth, 1u);
+   nHeight = std::max(nHeight, 1u);
+ 
++  int swsFlags = SWS_BICUBIC;
++  // FFmpeg 6.0.1's unscaled YUV-to-RGB C fast path handles 8/4/2-pixel
++  // blocks but not a final odd pixel. Its selection checks for even height,
++  // not even width. Accurate rounding excludes that path without changing
++  // the requested dimensions or masking an unwritten edge with memset.
++  const bool oddUnscaledYuv =
++      (nWidth & 1) != 0 && (nHeight & 1) == 0 &&
++      nWidth == m_originalWidth && nHeight == m_originalHeight &&
++      (pixFormat == AV_PIX_FMT_YUV420P || pixFormat == AV_PIX_FMT_YUV422P ||
++       pixFormat == AV_PIX_FMT_YUVA420P);
++  if (oddUnscaledYuv)
++  {
++    swsFlags |= SWS_ACCURATE_RND;
++    CLog::Log(LOGDEBUG,
++              "CFFmpegImage: odd-width unscaled YUV conversion bypass, {}x{}, format {}",
++              nWidth, nHeight, static_cast<int>(pixFormat));
++  }
++
+   struct SwsContext* context = sws_getContext(m_originalWidth, m_originalHeight, pixFormat,
+-    nWidth, nHeight, AV_PIX_FMT_RGB32, SWS_BICUBIC, NULL, NULL, NULL);
++    nWidth, nHeight, AV_PIX_FMT_RGB32, swsFlags, NULL, NULL, NULL);
+   if (!context)
+   {
+     CLog::LogF(LOGERROR, "Could not create a scaling context for {} x {} pixels", nWidth,
