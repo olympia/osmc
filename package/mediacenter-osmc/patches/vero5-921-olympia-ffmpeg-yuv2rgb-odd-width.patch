@@ -1,0 +1,132 @@
+From e7f034b1d86e1943663d2cc3a09470ec8f74b380 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Tue, 3 Nov 2026 19:18:53 +0100
+Subject: [PATCH] FFmpeg: carry the swscale fix for the last pixel of odd-width
+ rows
+
+Carry popcornmix's libswscale fix (FFmpeg PR 25723, 6e5ac96b9d) as
+tools/depends/target/ffmpeg/0003 and apply it after the two FFmpeg
+patches of vero5-000. The C YUV to RGB converters never wrote the last
+pixel of an odd-width row, which showed up as a changing line on the
+right edge of some posters. The FFmpeg patch is backported to 6.0.1
+for the 32-bit RGB converters only, the ones Kodi uses.
+
+It replaces vero5-920, which avoided the converter with
+SWS_ACCURATE_RND and made these conversions about 10 times slower.
+---
+ cmake/modules/FindFFMPEG.cmake                |  3 +-
+ ...ite-the-last-pixel-of-odd-width-rows.patch | 91 +++++++++++++++++++
+ 2 files changed, 93 insertions(+), 1 deletion(-)
+ create mode 100644 tools/depends/target/ffmpeg/0003-swscale-yuv2rgb-write-the-last-pixel-of-odd-width-rows.patch
+
+diff --git a/cmake/modules/FindFFMPEG.cmake b/cmake/modules/FindFFMPEG.cmake
+index 215280a..4cddac0 100644
+--- a/cmake/modules/FindFFMPEG.cmake
++++ b/cmake/modules/FindFFMPEG.cmake
+@@ -82,7 +82,8 @@ macro(buildFFMPEG)
+                     ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/CMakeLists.txt
+                     <SOURCE_DIR> &&
+                     /bin/bash -c "patch -p1 < ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/0001-added_upstream_mvc_patches.patch" &&
+-                    /bin/bash -c "patch -p1 < ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/0002-MKV-added-basic-block-addition-mapping-support-for-m.patch"
++                    /bin/bash -c "patch -p1 < ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/0002-MKV-added-basic-block-addition-mapping-support-for-m.patch" &&
++                    /bin/bash -c "patch -p1 < ${CMAKE_SOURCE_DIR}/tools/depends/target/ffmpeg/0003-swscale-yuv2rgb-write-the-last-pixel-of-odd-width-rows.patch"
+ )
+ 
+   if(CMAKE_GENERATOR STREQUAL Xcode)
+diff --git a/tools/depends/target/ffmpeg/0003-swscale-yuv2rgb-write-the-last-pixel-of-odd-width-rows.patch b/tools/depends/target/ffmpeg/0003-swscale-yuv2rgb-write-the-last-pixel-of-odd-width-rows.patch
+new file mode 100644
+index 0000000..f48248b
+--- /dev/null
++++ b/tools/depends/target/ffmpeg/0003-swscale-yuv2rgb-write-the-last-pixel-of-odd-width-rows.patch
+@@ -0,0 +1,91 @@
++From d9052334d1d93d246d98a76fb5a8c6aea881c1a1 Mon Sep 17 00:00:00 2001
++From: Dom Cobley <popcornmix@gmail.com>
++Date: Tue, 3 Nov 2026 16:53:22 +0000
++Subject: [PATCH] swscale/yuv2rgb: write the last pixel of odd width rows
++
++The C YUV420P/YUV422P/YUVA420P to RGB converters process each row in
++blocks of 8, 4 and 2 pixels, so for an odd output width the final
++pixel of every row was never written and kept whatever was in the
++destination buffer.
++
++The unscaled path selection only rejects odd heights, and the ARM and
++AArch64 NEON versions require widths divisible by 16, so on those
++platforms odd widths always reach this code. x86 SSSE3 rounds the row
++up to 8 pixels and so is unaffected.
++
++Add a single pixel stage after the 2 pixel stage.
++
++Signed-off-by: Dom Cobley <popcornmix@gmail.com>
++
++Backported to FFmpeg 6.0.1 for Kodi 21.3 (OSMC vero5 build) from
++FFmpeg PR 25723 (6e5ac96b9d), only for the 32-bit RGB converters
++(yuv2rgb_c_32, yuva2rgba_c, yuva2argb_c). In 6.0.1 these functions
++are written out one by one, and the alpha pointers are advanced by
++hand, so the single pixel stage advances them by 2 first.
++---
++ libswscale/yuv2rgb.c | 24 ++++++++++++++++++++++++
++ 1 file changed, 24 insertions(+)
++
++diff --git a/libswscale/yuv2rgb.c b/libswscale/yuv2rgb.c
++index 9c3f5e2..ba982b2 100644
++--- a/libswscale/yuv2rgb.c
+++++ b/libswscale/yuv2rgb.c
++@@ -79,6 +79,10 @@ const int *sws_getCoefficients(int colorspace)
++     Y              = src[2 * i + 1];                \
++     dst[2 * i + 1] = r[Y] + g[Y] + b[Y];
++ 
+++#define PUTRGB_ODD(dst, src, i)                     \
+++    Y              = src[2 * i];                    \
+++    dst[2 * i]     = r[Y] + g[Y] + b[Y];
+++
++ #define PUTRGB24(dst, src, i)                       \
++     Y              = src[2 * i];                    \
++     dst[6 * i + 0] = r[Y];                          \
++@@ -105,6 +109,10 @@ const int *sws_getCoefficients(int colorspace)
++     Y              = ysrc[2 * i + 1];                                   \
++     dst[2 * i + 1] = r[Y] + g[Y] + b[Y] + (asrc[2 * i + 1] << s);
++ 
+++#define PUTRGBA_ODD(dst, ysrc, asrc, i, s)                              \
+++    Y              = ysrc[2 * i];                                       \
+++    dst[2 * i]     = r[Y] + g[Y] + b[Y] + (asrc[2 * i]     << s);
+++
++ #define PUTRGB48(dst, src, i)                       \
++     Y                = src[ 2 * i];                 \
++     dst[12 * i +  0] = dst[12 * i +  1] = r[Y];     \
++@@ -265,6 +273,10 @@ ENDYUV2RGBLINE(8, 1)
++     LOADCHROMA(0);
++     PUTRGB(dst_1, py_1, 0);
++     PUTRGB(dst_2, py_2, 0);
+++ENDYUV2RGBLINE(8, 2)
+++    LOADCHROMA(0);
+++    PUTRGB_ODD(dst_1, py_1, 0);
+++    PUTRGB_ODD(dst_2, py_2, 0);
++ ENDYUV2RGBFUNC()
++ 
++ #if HAVE_BIGENDIAN
++@@ -303,6 +315,12 @@ ENDYUV2RGBLINE(8, 1)
++     LOADCHROMA(0);
++     PUTRGBA(dst_1, py_1, pa_1, 0, 24);
++     PUTRGBA(dst_2, py_2, pa_2, 0, 24);
+++    pa_1 += 2;
+++    pa_2 += 2;
+++ENDYUV2RGBLINE(8, 2)
+++    LOADCHROMA(0);
+++    PUTRGBA_ODD(dst_1, py_1, pa_1, 0, 24);
+++    PUTRGBA_ODD(dst_2, py_2, pa_2, 0, 24);
++ ENDYUV2RGBFUNC()
++ 
++ #if HAVE_BIGENDIAN
++@@ -341,6 +359,12 @@ ENDYUV2RGBLINE(8, 1)
++     LOADCHROMA(0);
++     PUTRGBA(dst_1, py_1, pa_1, 0, 0);
++     PUTRGBA(dst_2, py_2, pa_2, 0, 0);
+++    pa_1 += 2;
+++    pa_2 += 2;
+++ENDYUV2RGBLINE(8, 2)
+++    LOADCHROMA(0);
+++    PUTRGBA_ODD(dst_1, py_1, pa_1, 0, 0);
+++    PUTRGBA_ODD(dst_2, py_2, pa_2, 0, 0);
++ ENDYUV2RGBFUNC()
++ 
++ YUV2RGBFUNC(yuv2rgb_c_24_rgb, uint8_t, 0)
