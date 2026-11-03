@@ -1,39 +1,46 @@
-Subject: [PATCH] [vero5] Avoid an unwritten edge in odd-width YUV image conversion
+From e4f67b1ea29a7108b8cf709b575fc7fadfd5ec76 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Mon, 2 Nov 2026 21:57:09 +0100
+Subject: [PATCH] FFmpegImage: avoid an unwritten last column in odd-width YUV
+ conversion
 
-Target Kodi 21.3 a3a448d plus the all/arm/vero5 series through 918.
-The Moonraker 379x540 cache JPEG yielded different BGRA bytes only in
-column 378 across otherwise identical loads, before ClampToEdge and GPU
-upload. FFmpeg 6.0.1's generic unscaled yuv2rgb_c_32 handles 8/4/2 pixel
-blocks, leaving an odd final column unwritten. Its selection requires
-even height but does not exclude odd width. The ARM NEON unscaled path
-requires width divisible by 16 and therefore cannot handle this case.
+FFmpeg's unscaled YUV-to-RGB C converter (yuv2rgb_c_32 and yuva2rgba_c
+in libswscale/yuv2rgb.c) writes 8, 4 and 2 pixel blocks and never the
+final pixel of an odd width. swscale picks it for unscaled YUV420P,
+YUV422P and YUVA420P to RGB conversions when the height is even and
+SWS_ACCURATE_RND is not set; the width is not checked. The ARM NEON
+replacement needs a width divisible by 16, so on armhf the C converter
+runs. Kodi decodes into an uncleared texture buffer, so the last image
+column held leftover memory, and ClampToEdge() copied it into the
+padding. That gave the changing line on the right edge of some posters.
 
-For the matching odd-width/even-height unscaled YUV420P/YUV422P/YUVA420P
-image conversions, request SWS_ACCURATE_RND to exclude the generic fast
-path. ConvertFormats already maps YUVJ420P/422P to these formats. Keep
-the image dimensions and existing range handling. Other image conversions
-retain SWS_BICUBIC. This is a targeted Kodi-side workaround, not a backport
-of an upstream FFmpeg fix. Revisit when updating the bundled FFmpeg.
-Accurate rounding may change RGB values versus the fast path.
+For exactly that case request SWS_ACCURATE_RND, which makes swscale
+take its generic path. It writes every column and keeps the image size
+and the full range handling. Clearing the buffer would only have hidden
+the edge. Other conversions keep SWS_BICUBIC. Accurate rounding may
+change RGB values slightly against the fast path.
 
-Validated on Vero V: the same unchanged Moonraker cache JPEG was displayed
-without corruption over eight separate loads, with byte-identical complete
-upload buffers. Diagnostics patch 919 was used for that measurement and
-is not required by this fix. Broader image coverage and performance remain
-to be checked without diagnostics.
+Checked against FFmpeg n6.0.1, which Kodi 21.3 builds. FFmpeg master
+(aab6cec) still has the same block structure and selection.
+
+Validated on the Vero V with the 379x540 Moonraker cache JPEG: eight
+separate loads showed no artifact and gave byte-identical upload
+buffers.
+---
+ xbmc/guilib/FFmpegImage.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
 
 diff --git a/xbmc/guilib/FFmpegImage.cpp b/xbmc/guilib/FFmpegImage.cpp
+index 2cf3eb4..af0c6ba 100644
 --- a/xbmc/guilib/FFmpegImage.cpp
 +++ b/xbmc/guilib/FFmpegImage.cpp
-@@ -505,8 +505,21 @@
+@@ -505,8 +505,19 @@ bool CFFmpegImage::DecodeFrame(AVFrame* frame, unsigned int width, unsigned int
    nWidth = std::max(nWidth, 1u);
    nHeight = std::max(nHeight, 1u);
  
 +  int swsFlags = SWS_BICUBIC;
-+  // FFmpeg 6.0.1's unscaled YUV-to-RGB C fast path handles 8/4/2-pixel
-+  // blocks but not a final odd pixel. Its selection checks for even height,
-+  // not even width. Accurate rounding excludes that path without changing
-+  // the requested dimensions or masking an unwritten edge with memset.
++  // FFmpeg's unscaled YUV-to-RGB C path leaves the last column of an odd width unwritten;
++  // accurate rounding makes swscale take its generic path instead.
 +  const bool oddUnscaledYuv =
 +      (nWidth & 1) != 0 && (nHeight & 1) == 0 &&
 +      nWidth == m_originalWidth && nHeight == m_originalHeight &&
