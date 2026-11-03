@@ -1,6 +1,6 @@
-Subject: [PATCH] [vero5] Test bypass for odd-width unscaled YUV image conversion
+Subject: [PATCH] [vero5] Avoid an unwritten edge in odd-width YUV image conversion
 
-Target Kodi 21.3 a3a448d plus the all/arm/vero5 series through 919.
+Target Kodi 21.3 a3a448d plus the all/arm/vero5 series through 918.
 The Moonraker 379x540 cache JPEG yielded different BGRA bytes only in
 column 378 across otherwise identical loads, before ClampToEdge and GPU
 upload. FFmpeg 6.0.1's generic unscaled yuv2rgb_c_32 handles 8/4/2 pixel
@@ -11,15 +11,21 @@ requires width divisible by 16 and therefore cannot handle this case.
 For the matching odd-width/even-height unscaled YUV420P/YUV422P/YUVA420P
 image conversions, request SWS_ACCURATE_RND to exclude the generic fast
 path. ConvertFormats already maps YUVJ420P/422P to these formats. Keep
-the image dimensions, existing range handling and diagnostic snapshots.
-Other image conversions retain SWS_BICUBIC. This is a targeted test
-workaround, not a backport of an upstream FFmpeg fix; on-device validation
-is required. Accurate rounding may change RGB values versus the fast path.
+the image dimensions and existing range handling. Other image conversions
+retain SWS_BICUBIC. This is a targeted Kodi-side workaround, not a backport
+of an upstream FFmpeg fix. Revisit when updating the bundled FFmpeg.
+Accurate rounding may change RGB values versus the fast path.
+
+Validated on Vero V: the same unchanged Moonraker cache JPEG was displayed
+without corruption over eight separate loads, with byte-identical complete
+upload buffers. Diagnostics patch 919 was used for that measurement and
+is not required by this fix. Broader image coverage and performance remain
+to be checked without diagnostics.
 
 diff --git a/xbmc/guilib/FFmpegImage.cpp b/xbmc/guilib/FFmpegImage.cpp
 --- a/xbmc/guilib/FFmpegImage.cpp
 +++ b/xbmc/guilib/FFmpegImage.cpp
-@@ -505,8 +505,26 @@
+@@ -505,8 +505,21 @@
    nWidth = std::max(nWidth, 1u);
    nHeight = std::max(nHeight, 1u);
  
@@ -34,12 +40,7 @@ diff --git a/xbmc/guilib/FFmpegImage.cpp b/xbmc/guilib/FFmpegImage.cpp
 +      (pixFormat == AV_PIX_FMT_YUV420P || pixFormat == AV_PIX_FMT_YUV422P ||
 +       pixFormat == AV_PIX_FMT_YUVA420P);
 +  if (oddUnscaledYuv)
-+  {
 +    swsFlags |= SWS_ACCURATE_RND;
-+    CLog::Log(LOGDEBUG,
-+              "CFFmpegImage: odd-width unscaled YUV conversion bypass, {}x{}, format {}",
-+              nWidth, nHeight, static_cast<int>(pixFormat));
-+  }
 +
    struct SwsContext* context = sws_getContext(m_originalWidth, m_originalHeight, pixFormat,
 -    nWidth, nHeight, AV_PIX_FMT_RGB32, SWS_BICUBIC, NULL, NULL, NULL);
