@@ -1,5 +1,12 @@
 # Vero V poszterszél-diagnosztika
 
+**Történeti mérőeszköz, az olympia3 buildben nincs bekapcsolható diagnosztika.**
+A 919-es instrumentációs patch-et a véglegesítéskor eltávolítottuk a buildből.
+Az alábbi aktiválási leírás a korábbi, 919-et tartalmazó tesztbuildekre vonatkozik;
+az `analyze.py` és a tesztjei a megőrzött mérési adatok feldolgozására maradtak meg.
+A 920-as javítás eredményét és a végső készülékes ellenőrzést a `TEST-920.hu.md`
+foglalja össze. A régi patch szükség esetén a Git-történetből visszakereshető.
+
 Ez a diagnosztikai patch a Kodi CPU oldali képadatát hasonlítja össze a
 GPU-n megjelenő eredménnyel. Nem javítja és nem változtatja meg a skálázást,
 a képpontokat, a keretet vagy a szűrési beállításokat.
