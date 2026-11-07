@@ -18,9 +18,8 @@ the node no longer loads, the db path is loaded as before. The pair is
 dropped when the window is opened with a path of its own or reset.
 
 Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
-xbmc/xbmc master, branch fix-library-filter-node-reload (b44df4aa2f).
-Omega has no ITEM::PROPERTY::LIBRARY_FILTER, so the "library.filter"
-string is used.
+xbmc/xbmc#30368 (b44df4aa2f). Omega has no ITEM::PROPERTY::LIBRARY_FILTER,
+so the "library.filter" string is used.
 ---
  xbmc/windows/GUIMediaWindow.cpp | 32 ++++++++++++++++++++++++++++++--
  xbmc/windows/GUIMediaWindow.h   |  3 +++
