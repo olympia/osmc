@@ -1,8 +1,10 @@
-From b44df4aa2f8bd885684cf0727609edd9f5cb1cac Mon Sep 17 00:00:00 2001
+From a858d1e2eaa8dc1c7d45299b9cd7661068c1bb2a Mon Sep 17 00:00:00 2001
 From: olympia <olympia@xbmc.org>
-Date: Sat, 7 Nov 2026 02:15:00 +0100
+Date: Sat, 7 Nov 2026 23:50:43 +0100
 Subject: [PATCH] [GUIMediaWindow] Reload a library filter node through the
  node
+
+[GUIMediaWindow] Reload a library filter node through the node (b44df4a)
 
 A library filter node gives its items the db path it resolves to, so the
 window path, the history and every later refresh use the videodb or
@@ -17,19 +19,36 @@ The window path, the history and the parent item keep the db path. If
 the node no longer loads, the db path is loaded as before. The pair is
 dropped when the window is opened with a path of its own or reset.
 
+[GUIMediaWindow] Keep the library filter node when its load fails (a858d1e)
+
+A load through a library filter node that fails while the node file is
+still there was cancelled from the busy dialog, or the node is hidden by
+its visible condition. Return false in that case, as master does on a
+cancel, and keep the remembered node. Loading the db path in its place
+ran the same slow query again under a second dialog and dropped the node
+for every later reload in the window.
+
 Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
-xbmc/xbmc#30368 (b44df4aa2f). Omega has no ITEM::PROPERTY::LIBRARY_FILTER,
-so the "library.filter" string is used.
+xbmc/xbmc#30368 (a858d1e), its two commits squashed. Omega has no
+ITEM::PROPERTY::LIBRARY_FILTER, so the "library.filter" string is used.
 ---
- xbmc/windows/GUIMediaWindow.cpp | 32 ++++++++++++++++++++++++++++++--
+ xbmc/windows/GUIMediaWindow.cpp | 38 ++++++++++++++++++++++++++++++++++++--
  xbmc/windows/GUIMediaWindow.h   |  3 +++
- 2 files changed, 33 insertions(+), 2 deletions(-)
+ 2 files changed, 39 insertions(+), 2 deletions(-)
 
 diff --git a/xbmc/windows/GUIMediaWindow.cpp b/xbmc/windows/GUIMediaWindow.cpp
-index 20dc626979..4ce0e2e1c1 100644
+index 20dc626979..608b189749 100644
 --- a/xbmc/windows/GUIMediaWindow.cpp
 +++ b/xbmc/windows/GUIMediaWindow.cpp
-@@ -331,6 +331,8 @@ bool CGUIMediaWindow::OnMessage(CGUIMessage& message)
+@@ -31,6 +31,7 @@
+ #include "dialogs/GUIDialogMediaFilter.h"
+ #include "dialogs/GUIDialogProgress.h"
+ #include "dialogs/GUIDialogSmartPlaylistEditor.h"
++#include "filesystem/Directory.h"
+ #include "filesystem/FileDirectoryFactory.h"
+ #include "filesystem/MultiPathDirectory.h"
+ #include "filesystem/PluginDirectory.h"
+@@ -331,6 +332,8 @@ bool CGUIMediaWindow::OnMessage(CGUIMessage& message)
        if (message.GetParam1() == GUI_MSG_WINDOW_RESET)
        {
          m_vecItems->SetPath("?");
@@ -38,7 +57,7 @@ index 20dc626979..4ce0e2e1c1 100644
          return true;
        }
        else if ( message.GetParam1() == GUI_MSG_REFRESH_THUMBS )
-@@ -548,6 +550,8 @@ bool CGUIMediaWindow::OnMessage(CGUIMessage& message)
+@@ -548,6 +551,8 @@ bool CGUIMediaWindow::OnMessage(CGUIMessage& message)
          }
          if (resetHistory)
          {
@@ -47,7 +66,7 @@ index 20dc626979..4ce0e2e1c1 100644
            m_vecItems->RemoveDiscCache(GetID());
            // only compute the history for the provided path if "return" is not defined
            // (otherwise the root level for the path will be added by default to the path history
-@@ -750,11 +754,27 @@ bool CGUIMediaWindow::GetDirectory(const std::string &strDirectory, CFileItemLis
+@@ -750,11 +755,32 @@ bool CGUIMediaWindow::GetDirectory(const std::string &strDirectory, CFileItemLis
        SetupShares();
  
      CFileItemList dirItems;
@@ -61,6 +80,11 @@ index 20dc626979..4ce0e2e1c1 100644
 +      if (viaNode)
 +      {
 +        m_libraryFilterDbPath = nodeItems.GetPath();
++      }
++      else if (XFILE::CDirectory::Exists(m_libraryFilterNodePath, false))
++      {
++        // still there, so cancelled or hidden: don't load the db path in its place
++        return false;
 +      }
 +      else
 +      {
@@ -77,7 +101,7 @@ index 20dc626979..4ce0e2e1c1 100644
  
      // took over a second, and not normally cached, so cache it
      auto end = std::chrono::steady_clock::now();
-@@ -860,6 +880,14 @@ bool CGUIMediaWindow::Update(const std::string &strDirectory, bool updateFilterP
+@@ -860,6 +886,14 @@ bool CGUIMediaWindow::Update(const std::string &strDirectory, bool updateFilterP
      return false;
    }
  
