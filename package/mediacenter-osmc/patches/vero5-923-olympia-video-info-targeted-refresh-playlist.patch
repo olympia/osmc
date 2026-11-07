@@ -1,0 +1,72 @@
+From acd91788f0d704465253471f3cfe884e0a20def4 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Sat, 7 Nov 2026 14:20:25 +0100
+Subject: [PATCH] [Video] Update a refreshed movie in place in smart playlists
+ too
+
+Refreshing a movie from the information dialog updates only its list item,
+but the refreshed movie was looked up again only in videodb listings. A
+smart playlist is listed from its .xsp path, so the whole list was always
+reloaded there. Look it up through the library path the playlist was listed
+from instead.
+
+A lookup by id would also find a movie that a limit of the listing leaves
+out, so a listing with a limit still gets a full refresh.
+
+Also keep the program count of the old list item, which holds the playlist
+order, so the movie stays in place in a playlist without its own order.
+
+Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
+olympia/xbmc 07ae9bb3b8 (branch video-info-targeted-refresh-playlist, PR not
+opened yet). Omega names: CFileItemList::IsVideoDb(),
+NODE_TYPE_TITLE_MOVIES, the "ParentPath" string, CSmartPlaylist outside a
+namespace and the m_iprogramCount member.
+---
+ xbmc/video/windows/GUIWindowVideoBase.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/video/windows/GUIWindowVideoBase.cpp b/xbmc/video/windows/GUIWindowVideoBase.cpp
+index cc396cd..9431052 100644
+--- a/xbmc/video/windows/GUIWindowVideoBase.cpp
++++ b/xbmc/video/windows/GUIWindowVideoBase.cpp
+@@ -38,6 +38,7 @@
+ #include "music/dialogs/GUIDialogMusicInfo.h"
+ #include "playlists/PlayList.h"
+ #include "playlists/PlayListFactory.h"
++#include "playlists/SmartPlayList.h"
+ #include "profiles/ProfileManager.h"
+ #include "settings/AdvancedSettings.h"
+ #include "settings/Settings.h"
+@@ -624,18 +625,28 @@ bool CGUIWindowVideoBase::UpdateMovieListItem(const std::string& listItemPath,
+     if (!m_database.Open())
+       return false;
+ 
+-    if (m_vecItems->IsVideoDb())
++    // the filter path holds the library path a smart playlist was listed from
++    const std::string dbPath{m_vecItems->IsVideoDb() ? m_vecItems->GetPath() : m_strFilterPath};
++    if (URIUtils::IsVideoDb(dbPath))
+     {
++      // a query by id finds the movie even when a limit leaves it out of the listing
++      const CURL dbUrl{dbPath};
++      CSmartPlaylist xsp;
++      const bool hasLimit{dbUrl.HasOption("xsp") && xsp.LoadFromJson(dbUrl.GetOption("xsp")) &&
++                          xsp.GetLimit() > 0};
++
+       // the refresh adds the movie again with a new id, query it the way the listing did
+       const CDatabase::Filter filter{
+           StringUtils::Format("movie_view.idMovie = {}", item.GetVideoInfoTag()->m_iDbId)};
+       CFileItemList items;
+-      if (CVideoDatabaseDirectory::GetDirectoryChildType(m_vecItems->GetPath()) ==
+-              NODE_TYPE_TITLE_MOVIES &&
+-          m_database.GetMoviesByWhere(m_vecItems->GetPath(), filter, items) && items.Size() == 1)
++      if (!hasLimit &&
++          CVideoDatabaseDirectory::GetDirectoryChildType(dbPath) == NODE_TYPE_TITLE_MOVIES &&
++          m_database.GetMoviesByWhere(dbPath, filter, items) && items.Size() == 1)
+       {
+         newItem = items.Get(0);
+         newItem->SetProperty("ParentPath", listItem->GetProperty("ParentPath"));
++        // the program count holds the order of a smart playlist
++        newItem->m_iprogramCount = listItem->m_iprogramCount;
+       }
+     }
+     else
