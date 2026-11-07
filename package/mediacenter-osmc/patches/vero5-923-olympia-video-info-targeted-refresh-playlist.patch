@@ -17,8 +17,7 @@ Also keep the program count of the old list item, which holds the playlist
 order, so the movie stays in place in a playlist without its own order.
 
 Backported to Kodi 21.3-Omega (a3a448d) for the OSMC vero5 build from
-olympia/xbmc 07ae9bb3b8 (branch video-info-targeted-refresh-playlist, PR not
-opened yet). Omega names: CFileItemList::IsVideoDb(),
+xbmc/xbmc#30387 (07ae9bb3b8). Omega names: CFileItemList::IsVideoDb(),
 NODE_TYPE_TITLE_MOVIES, the "ParentPath" string, CSmartPlaylist outside a
 namespace and the m_iprogramCount member.
 ---
