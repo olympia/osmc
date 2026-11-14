@@ -50,7 +50,7 @@ diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
 index 714ea91..025542a 100644
 --- a/xbmc/application/Application.cpp
 +++ b/xbmc/application/Application.cpp
-@@ -2722,11 +2722,17 @@ void CApplication::StopPlaying()
+@@ -2742,11 +2742,17 @@ void CApplication::StopPlaying()
  
    if (gui)
    {
